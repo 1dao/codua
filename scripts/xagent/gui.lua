@@ -1,0 +1,1884 @@
+-- xagent/gui.lua — desktop chat GUI (raygui). The interaction layer.
+--
+-- A tick-driven immediate-mode window: the runner calls __update each tick to
+-- draw one frame, and the same tick pumps xpoll/xtimer so the LLM stream and
+-- the subprocess worker keep progressing between frames. The agent runs as a
+-- coroutine started on Send; its on_event updates the transcript, which renders
+-- live. UTF-8 input/output is native (no console code-page issues).
+--
+-- Run: bin/xnet scripts/xagent/gui.lua
+
+package.path = 'scripts/?.lua;tools/?.lua;' .. package.path
+package.cpath = 'tools/?.dll;tools/?.so;' .. package.cpath
+
+local router        = dofile('scripts/core/share/xrouter.lua')
+local raygui        = require('raygui')
+local xutils        = require('xutils')
+local config        = require('xagent.config')
+local registry      = require('xagent.tools.registry')
+local system_prompt = require('xagent.context.system_prompt')
+local project_md    = require('xagent.context.project_md')
+local subprocess    = require('xagent.proc.subprocess')
+local mcp           = require('xagent.mcp.bootstrap')
+local mcp_registry  = require('xagent.mcp.registry')
+local session       = require('xagent.session.session')
+local transcript    = require('xagent.ui.transcript')
+local markdown      = require('xagent.ui.markdown')
+local complete      = require('xagent.ui.complete')
+local text          = dofile('scripts/core/share/xtext.lua') ---@type xtext
+local fs            = dofile('scripts/core/share/xfs.lua') ---@type xfs
+local async         = dofile('scripts/core/share/xasync.lua') ---@type xasync
+local api_log       = require('xagent.llm.api_log')
+
+registry.register(require('xagent.tools.read'))
+registry.register(require('xagent.tools.write'))
+registry.register(require('xagent.tools.edit'))
+registry.register(require('xagent.tools.ls'))
+registry.register(require('xagent.tools.glob'))
+registry.register(require('xagent.tools.grep'))
+registry.register(require('xagent.tools.bash'))
+registry.register(require('xagent.tools.multi_edit'))
+registry.register(require('xagent.tools.web_fetch'))
+registry.register(require('xagent.tools.memory_write'))
+registry.register(require('xagent.tools.todo_write').tool)
+registry.register(require('xagent.tools.skill'))
+
+local skills    = require('xagent.skills')
+local open_url  = require('xagent.ui.open_url')
+
+local IS_WIN = (package.config:sub(1, 1) == '\\')
+local FONT_SIZE = 16
+
+-- Starting per-turn output cap. A bigger cap is free — you only pay for tokens
+-- actually produced — but a TOO-SMALL cap silently breaks big outputs: an
+-- AetherViz single-file page (Three.js + KaTeX + heavy CSS) can run ~10k+ tokens
+-- and at 8192 the tool_use JSON gets truncated mid-stream (→ unparseable args).
+-- 16384 fits those pages; if the model is STILL cut off the loop auto-escalates
+-- max_tokens up to the model's output ceiling (see loop.MAX_TOKENS_CEILING).
+-- Override the start value with XAGENT_MAX_TOKENS (NOTE: must stay ≤ the model's
+-- hard output limit, or every request fails).
+local MAX_TOKENS = tonumber(xutils.get_config('XAGENT_MAX_TOKENS'))
+    or tonumber(os.getenv('XAGENT_MAX_TOKENS')) or 16384
+
+-- Pre-seed common glyphs so streaming text doesn't keep rebuilding the font
+-- atlas (every rebuild re-rasterizes the whole texture and makes ALL text —
+-- header included — flicker). Covers CJK ideographs + CJK/fullwidth punctuation
+-- + a few common symbols. ASCII is seeded by load_font itself.
+local function preseed_charset()
+    local t = {}
+    local function range(a, b) for cp = a, b do t[#t + 1] = utf8.char(cp) end end
+    range(0x4E00, 0x9FFF)   -- CJK Unified Ideographs (common Chinese)
+    range(0x3000, 0x303F)   -- CJK symbols & punctuation
+    range(0xFF00, 0xFFEF)   -- fullwidth forms
+    range(0x2010, 0x2027)   -- hyphens / en+em dashes (—, U+2014) / quotes / bullet / ellipsis
+    range(0x2190, 0x21B5)   -- arrows
+    range(0x2200, 0x22FF)   -- mathematical operators (≈ ≠ ≤ ≥ ∞ ∑ √ ∈ …)
+    range(0x25A0, 0x25FF)   -- geometric shapes (○ ● ◦ ■ □ ▲ ▶ …)
+    range(0x2600, 0x26FF)   -- misc symbols (★ ☆ ☰ ☐ ☑ …; only those in the font load)
+    -- specific common symbols outside the ranges above
+    for _, cp in ipairs({ 0x00A0, 0x00B0, 0x00B1, 0x00B7, 0x00D7, 0x00F7,
+                          0x00A2, 0x00A3, 0x00A5, 0x00A9, 0x00AE, 0x20AC, 0x2122,
+                          0xFE19,            -- ︙ vertical kebab (the font lacks ⋮ U+22EE)
+                          0x2713, 0x2714, 0x2705, 0x274C, 0x2714 }) do
+        t[#t + 1] = utf8.char(cp)
+    end
+    return table.concat(t)
+end
+
+-- Per-conversation state lives on a TAB (S.tabs[i]); S holds the tab list plus
+-- the active index and all app-level (cross-tab) state. Each tab carries its own
+-- model profile, session, transcript view, input, busy/status, budget, pending
+-- confirm, attachments and working directory — so several models can run at once
+-- and a background tab keeps streaming while another is shown. A tab looks like:
+--   { id, cfg, sess, view, entries={}, cur, text_tail='',
+--     input='', input_edit=true, busy=false, status='ready', budget,
+--     pending_confirm, attachments={}, cwd='.' }
+local S = {
+    tabs = {},                 -- list of tabs (one per conversation)
+    active = 1,                -- index of the active tab
+    profiles = nil,            -- configured LLM profiles (config.load_profiles())
+    tab_picker = false,        -- the "+" new-tab model-picker popup is open
+    plus_x = 0,                -- screen x of the "+" button (picker anchor)
+    next_tab_id = 1,
+    -- settings page: theme/model dropdowns + the add-model form
+    dd_open = nil,             -- which dropdown is open: nil | 'theme' | 'model'
+    dd_anchor = nil,           -- { x, y, w } of the open dropdown button
+    model_sel = 1,             -- selected profile index in the model dropdown
+    add_model = nil,           -- the add-model form state while it's open
+    -- tool permission mode: 'write' = auto-run (default), 'ask' = confirm each
+    -- state-changing tool before it runs. The parked await lives per-tab.
+    mode = 'write',
+    emoji_tex = nil,
+    on_copy = nil,             -- copy handler shared by every tab's view
+    view_bg = nil,             -- transcript bg from the active theme (new views use it)
+    started = false,
+    -- left sidebar: nil | 'history' | 'settings' | 'apilog'
+    sidebar = nil,
+    history_items = {},
+    history_scroll = 0,        -- pixel scroll offset of the history list
+    -- API request/response log panel (in-memory, this run only)
+    apilog_scroll = 0,         -- pixel scroll of the API-log list
+    apilog_selected = nil,     -- the log record whose detail is shown in the main area
+    log_view = nil,            -- transcript view used to render the selected record
+    renaming = nil,            -- id of the session being renamed inline
+    rename_text = '',
+    rename_edit = false,
+    confirm_delete = nil,      -- id of the session awaiting delete confirmation
+    menu_item = nil,           -- history item whose ⋮ menu is open
+    menu_y = 0,                -- screen y of that menu
+    -- theme
+    theme = 'nord',
+    header_bg = { 30, 30, 38, 255 },
+    sidebar_bg = { 26, 26, 32, 255 },
+    picking_dir = false,       -- a folder dialog is currently open
+    frame = 0,                 -- frame counter (drives the thinking-dots animation)
+    -- input autocomplete (/ commands, @ file refs): computed from the ACTIVE tab
+    menu = nil,                -- { kind, items, prefix } computed each frame, or nil
+    menu_sel = 1,              -- highlighted item (1-based)
+    menu_off = 0,              -- first visible row when the list scrolls
+    menu_dismissed_for = nil,  -- input text the user pressed Esc on (re-show on edit)
+    dir_cache = {},            -- abspath -> immediate children, for the @ picker
+}
+
+local SIDEBAR_W = 290
+local HEADER_H  = 38               -- top bar (title/status/meter/toggles)
+local TABBAR_H  = 32               -- tab strip below the top bar
+local TOP       = HEADER_H + TABBAR_H   -- top y of the sidebar / main content
+local THEMES = { 'nord', 'soft', 'candy', 'cyber', 'dark' }
+local THEME_FILE = (fs.home():gsub('[/\\]+$', '')) .. '/.xagent/theme'
+-- Last picked working directory, persisted so the NEXT app launch defaults its
+-- initial session to it (mirrors how THEME_FILE persists the color theme).
+local CWD_FILE   = (fs.home():gsub('[/\\]+$', '')) .. '/.xagent/cwd'
+
+-- ── color helpers ──────────────────────────────────────────────────────────
+local function unpack_color(v)
+    return { (v >> 24) & 0xFF, (v >> 16) & 0xFF, (v >> 8) & 0xFF, v & 0xFF }
+end
+local function clamp8(x) return math.max(0, math.min(255, math.floor(x + 0.5))) end
+local function shift(c, d) return { clamp8(c[1] + d), clamp8(c[2] + d), clamp8(c[3] + d), c[4] or 255 } end
+local function mix(a, b, t)
+    return { clamp8(a[1] + (b[1] - a[1]) * t), clamp8(a[2] + (b[2] - a[2]) * t),
+             clamp8(a[3] + (b[3] - a[3]) * t), 255 }
+end
+local function luma(c) return 0.299 * c[1] + 0.587 * c[2] + 0.114 * c[3] end
+
+-- Vertical "⋮" (kebab) button. NotoSansSC has NO vertical-three-dots glyph
+-- (lacks ⋮ U+22EE; its ︙ U+FE19 renders horizontally), so we draw the three
+-- dots ourselves over an empty button (which keeps the hover bg + click).
+local function kebab_button(x, y, w, h, col)
+    local clicked = raygui.button(x, y, w, h, '')
+    local d, sp = 3, 5
+    local cx = x + math.floor(w / 2) - math.floor(d / 2)
+    local cy = y + math.floor(h / 2) - sp - 1
+    for k = 0, 2 do
+        raygui.draw_rectangle(cx, cy + k * sp, d, d, col[1], col[2], col[3], col[4] or 255)
+    end
+    return clicked
+end
+
+-- Filled-square "stop" button (shown in the input box while a turn is running;
+-- click requests cancellation at the next turn boundary). Hand-drawn like the
+-- kebab — the font has no reliable ■ glyph at this size.
+local function stop_button(x, y, w, h, col)
+    local clicked = raygui.button(x, y, w, h, '')
+    local d = 10
+    raygui.draw_rectangle(x + math.floor((w - d) / 2), y + math.floor((h - d) / 2), d, d,
+        col[1], col[2], col[3], col[4] or 255)
+    return clicked
+end
+
+-- Small hand-drawn "×" centered in (x,y,w,h). Used for the tab close affordance:
+-- drawn directly (NO button frame) so it doesn't render a second border inside
+-- the tab. Same rationale as kebab/stop — a label '#113#' icon code isn't
+-- reliable in this wrapper, and a nested button looks misaligned.
+local function draw_x(x, y, w, h, col, r)
+    r = r or 4
+    local cx, cy = x + w / 2, y + h / 2
+    for d = -r, r do
+        raygui.draw_rectangle(math.floor(cx + d - 1), math.floor(cy + d - 1), 2, 2,
+            col[1], col[2], col[3], col[4] or 255)
+        raygui.draw_rectangle(math.floor(cx + d - 1), math.floor(cy - d - 1), 2, 2,
+            col[1], col[2], col[3], col[4] or 255)
+    end
+end
+
+-- Small hand-drawn caret (▼ / ▲) centered at (cx, cy) — the dropdown indicator.
+-- Hand-drawn for the same reason as draw_x: triangle glyphs aren't reliable here.
+local function draw_caret(cx, cy, col, up)
+    for k = 0, 3 do
+        local w = 7 - 2 * k
+        local row = up and (3 - k) or k
+        raygui.draw_rectangle(math.floor(cx - w / 2), math.floor(cy - 2 + row),
+            math.max(1, w), 1, col[1], col[2], col[3], col[4] or 255)
+    end
+end
+
+-- ── working-directory helpers (history grouping + the editable current dir) ──
+-- Normalized key so "C:\a\b", "c:/a/b/" group together on Windows.
+local function dir_key(d)
+    d = tostring(d or ''):gsub('\\', '/'):gsub('/+$', '')
+    if IS_WIN then d = d:lower() end
+    return d
+end
+
+-- Short display form: the last two path components.
+local function dir_tail(d)
+    d = tostring(d or ''):gsub('[\\/]+$', '')
+    return d:match('([^\\/]+[\\/][^\\/]+)$') or d:match('([^\\/]+)$') or d
+end
+
+-- True if `dir` exists. Validated via cmd's EXIT CODE only: with the UTF-8
+-- activeCodePage manifest on xnet.exe, the UTF-8 path converts correctly INTO
+-- the child process, but cmd's piped OUTPUT is still in the console code page
+-- (GBK) — echoing a non-ASCII path back through it would re-mangle the bytes,
+-- so the caller keeps its own UTF-8 string.
+local function dir_exists(dir)
+    local f = io.popen(IS_WIN and ('cd /d "' .. dir .. '" 2>nul')
+                              or ('cd "' .. dir .. '" 2>/dev/null'))
+    if not f then return false end
+    f:read('*a')
+    local ok, _how, code = f:close()   -- (true|nil, 'exit', code)
+    return ok == true or tonumber(code) == 0
+end
+
+-- UTF-8 → UTF-16LE (for PowerShell -EncodedCommand: no shell-quoting pitfalls,
+-- and non-ASCII paths in the embedded script survive intact).
+local function utf8_to_utf16le(s)
+    local out = {}
+    for _, cp in utf8.codes(s) do
+        if cp < 0x10000 then
+            out[#out + 1] = string.char(cp % 256, cp // 256)
+        else
+            local v = cp - 0x10000
+            local hi = 0xD800 + v // 0x400
+            local lo = 0xDC00 + v % 0x400
+            out[#out + 1] = string.char(hi % 256, hi // 256, lo % 256, lo // 256)
+        end
+    end
+    return table.concat(out)
+end
+
+-- Active tab accessor — per-conversation state lives on the tab, not S.
+local function T() return S.tabs[S.active] end
+
+local function add(tab, role, text)
+    local e = { role = role, text = text or '' }
+    tab.entries[#tab.entries + 1] = e
+    return e
+end
+
+-- Transient "thinking…" line shown in the transcript while a turn is busy but
+-- nothing has appeared yet — including the long, INVISIBLE stretch where a big
+-- tool argument (e.g. a whole HTML document) streams into the tool call. It's
+-- a normal entry kept as the LAST item, with dots animating off S.frame; removed
+-- the instant real content (text or a tool card) shows up, or the turn ends.
+local function clear_thinking(tab)
+    local th = tab.thinking
+    if not th then return end
+    for i = #tab.entries, 1, -1 do
+        if tab.entries[i] == th then table.remove(tab.entries, i); break end
+    end
+    tab.thinking = nil
+end
+
+local function update_thinking(tab)
+    -- Waiting for output: busy, nothing streaming yet, not parked on a
+    -- permission prompt (that has its own UI).
+    if not (tab.busy and not tab.cur and not tab.pending_confirm) then
+        clear_thinking(tab); return
+    end
+    local text = 'thinking' .. ('.'):rep(1 + math.floor(S.frame / 20) % 3)
+    if tab.thinking and tab.entries[#tab.entries] == tab.thinking then
+        tab.thinking.text = text                 -- already last: just refresh dots
+    else
+        clear_thinking(tab)                      -- a new entry got appended after it
+        tab.thinking = add(tab, 'thinking', text)
+    end
+end
+
+-- forward declarations (referenced before their definitions below)
+local new_session, new_tab, close_tab, select_tab
+
+local function compact(v)
+    local ok, s = pcall(xutils.json_pack, v)
+    if not ok then return tostring(v) end
+    if #s > 160 then s = s:sub(1, 160) .. '...' end
+    return s
+end
+
+-- Per-session permission gate handed to the agent (ctx.confirm). In 'write' mode
+-- (or for a turn whose session the tab has since replaced) it auto-allows; in
+-- 'ask' mode it parks the agent coroutine on an await until the user clicks
+-- 允许/拒绝. The await lives on the OWNING tab, so a background tab can park its
+-- own confirm (surfaced via a '!' on its tab button) without blocking others.
+-- Runs inside the agent coroutine, so async.await is safe here.
+local function make_confirm(tab, sess)
+    return function(req)
+        if S.mode ~= 'ask' then return true end
+        if tab.sess ~= sess then return true end   -- stale run of a replaced session: don't block
+        return async.await(function(resolve)
+            tab.pending_confirm = { req = req, resolve = resolve }
+        end)
+    end
+end
+
+-- Split off any trailing incomplete UTF-8 sequence so the displayed text is
+-- always valid (a multibyte char may straddle two stream deltas; feeding a half
+-- char to utf8.codes during emoji tokenization would error and crash the frame).
+local function utf8_split_complete(s)
+    local n = #s
+    if n == 0 then return '', '' end
+    for i = n, math.max(1, n - 3), -1 do
+        local b = s:byte(i)
+        if b < 0x80 then
+            return s, ''
+        elseif b >= 0xC0 then
+            local len = (b < 0xE0 and 2) or (b < 0xF0 and 3) or 4
+            if i + len - 1 <= n then return s, '' else return s:sub(1, i - 1), s:sub(i) end
+        end
+    end
+    return s, ''
+end
+
+local function flush_tail(tab)
+    if tab.cur and tab.text_tail ~= '' then tab.cur.text = tab.cur.text .. tab.text_tail end
+    tab.text_tail = ''
+    tab.cur = nil
+end
+
+local function on_event(tab, ev)
+    if ev.type == 'text' then
+        if not tab.cur then tab.cur = add(tab, 'assistant', '') end
+        local complete, tail = utf8_split_complete(tab.text_tail .. ev.text)
+        tab.text_tail = tail
+        tab.cur.text = tab.cur.text .. complete
+    elseif ev.type == 'tool_use' then
+        flush_tail(tab)
+        add(tab, 'tool', '> ' .. ev.name .. '  ' .. compact(ev.input))
+    elseif ev.type == 'tool_result' then
+        flush_tail(tab)
+        local c = (ev.result and ev.result.content) or ''
+        if type(c) ~= 'string' then c = '[non-text result]' end
+        if #c > 600 then c = c:sub(1, 600) .. '\n  ...' end
+        add(tab, 'tool_result', c)
+    elseif ev.type == 'budget' then
+        tab.budget = ev.budget
+    elseif ev.type == 'compact_start' then
+        flush_tail(tab)
+        tab.status = '压缩上下文'        -- distinct status (busy dots animate); not frozen
+    elseif ev.type == 'compact' then
+        flush_tail(tab)
+        -- A concise notice ONLY — the summary text belongs in the message
+        -- history (for the model), not dumped into the user's transcript.
+        if ev.did_compact then
+            add(tab, 'system', '📚 上下文已压缩' ..
+                (ev.kept_tail and ('，保留最近 ' .. ev.kept_tail .. ' 条消息') or ''))
+            tab.status = '思考中'         -- back to the answer that follows compaction
+        elseif ev.error then
+            add(tab, 'error', '压缩失败: ' .. tostring(ev.error))
+        end
+        -- did_micro alone is silent — it's background housekeeping near the
+        -- context limit, not something to announce in the transcript.
+    elseif ev.type == 'truncated_retry' then
+        -- The turn was cut off at max_tokens mid-output; the loop is re-running it
+        -- with a larger cap. Drop the partial assistant text so the re-stream
+        -- doesn't duplicate it; keep the turn busy (thinking dots continue).
+        if tab.cur then
+            for i = #tab.entries, 1, -1 do
+                if tab.entries[i] == tab.cur then table.remove(tab.entries, i); break end
+            end
+        end
+        tab.text_tail = ''; tab.cur = nil
+        tab.status = string.format('输出较大，提升上限重试 (%s→%s)',
+            tostring(ev.from or '?'), tostring(ev.to or '?'))
+    elseif ev.type == 'done' then
+        flush_tail(tab); clear_thinking(tab); tab.busy = false; tab.status = 'ready'
+    elseif ev.type == 'error' then
+        flush_tail(tab); clear_thinking(tab); add(tab, 'error', 'ERROR: ' .. tostring(ev.error)); tab.busy = false; tab.status = 'error'
+    end
+end
+
+-- Bind on_event to the TAB and the session that STARTED the run. Events always
+-- route to their owning tab (so a background tab keeps streaming while another
+-- is shown); the guard drops late events (text, compaction summary, done) once
+-- the tab has replaced that session via /new or a history load.
+local function make_on_event(tab, sess)
+    return function(ev)
+        if tab.sess ~= sess then return end
+        on_event(tab, ev)
+    end
+end
+
+-- Slash commands handled locally (not sent to the model). Returns true if the
+-- input was a command (and was consumed).
+local function handle_slash(text)
+    local orig_cmd, rest = text:match('^/(%S+)%s*(.*)$')
+    if not orig_cmd then return false end
+    local cmd = orig_cmd:lower()
+    local tab = T()
+    if cmd == 'compact' then
+        tab.input = ''; tab.busy = true; tab.status = '压缩中…'; tab.cur = nil
+        local sess = tab.sess
+        local handler = make_on_event(tab, sess)
+        local co = coroutine.create(function()
+            sess:compact(rest ~= '' and rest or nil, handler)
+            pcall(function() sess:save() end)
+            if tab.sess == sess then tab.busy = false; tab.status = 'ready' end
+        end)
+        local ok, err = coroutine.resume(co)
+        if not ok then handler({ type = 'error', error = err }) end
+        return true
+    elseif cmd == 'context' then
+        tab.input = ''
+        local b = tab.budget
+        if b then
+            add(tab, 'system', string.format('📊 上下文 ~%d / %d tokens (%.0f%%)  ·  状态 %s  ·  自动压缩阈值 %d',
+                b.estimated, b.context_window, b.percent * 100, b.state, b.auto_compact_threshold))
+        else
+            add(tab, 'system', '📊 暂无上下文用量数据（发送一条消息后可见）')
+        end
+        return true
+    elseif cmd == 'clear' or cmd == 'new' then
+        tab.input = ''
+        new_session()
+        return true
+    elseif cmd == 'mcp' then
+        tab.input = ''
+        local lines = { 'MCP 服务器:' }
+        local conns = mcp_registry.connections()
+        if S.mcp_status == 'connecting' then
+            lines[#lines + 1] = '（连接中…）'
+        end
+        if #conns == 0 then
+            lines[#lines + 1] = '（未配置；在 ~/.xagent/mcp.json 或 <当前目录>/.mcp.json ' ..
+                '中添加 mcpServers，重启后生效）'
+        else
+            for _, c in ipairs(conns) do
+                local entry = mcp_registry.get(c.name)
+                local n = entry and #entry.tools or 0
+                local icon = (c.status == 'connected' and '●')
+                    or (c.status == 'pending' and '◐') or '○'
+                local line = string.format('%s %s  [%s]  %d 工具', icon, c.name, c.status, n)
+                if c.error then line = line .. '  — ' .. tostring(c.error) end
+                lines[#lines + 1] = line
+            end
+        end
+        add(tab, 'system', table.concat(lines, '\n'))
+        return true
+    elseif cmd == 'help' then
+        tab.input = ''
+        local lines = { '可用命令:', '/compact [重点]  压缩上下文', '/context  查看上下文用量',
+                        '/mcp  查看 MCP 服务器', '/new  新会话（当前标签）', '/help  帮助',
+                        '（顶部 + 新建标签可同时跑多个模型）' }
+        local sk = require('xagent.skills').all_user_invocable()
+        if #sk > 0 then
+            lines[#lines + 1] = ''
+            lines[#lines + 1] = '技能(/<名称> [参数]):'
+            for _, s in ipairs(sk) do lines[#lines + 1] = '/' .. s.name .. '  ' .. (s.description or '') end
+        end
+        add(tab, 'system', table.concat(lines, '\n'))
+        return true
+    end
+
+    -- Not a built-in: maybe a user-invoked skill (/<skill-name> [args]).
+    local skill = require('xagent.skills').find_invocable(orig_cmd)
+    if skill then
+        tab.input = ''
+        local prompt = require('xagent.skills').render_body(skill, rest, tab.sess and tab.sess.id or 'unknown-session')
+        add(tab, 'user', text)                -- echo what the user typed
+        tab.busy = true; tab.status = '思考中'; tab.cur = nil
+        local sess = tab.sess
+        local handler = make_on_event(tab, sess)
+        sess.cancelled = nil
+        sess:add_user(prompt)
+        local co = coroutine.create(function()
+            sess:run(handler); pcall(function() sess:save() end)
+        end)
+        local ok, err = coroutine.resume(co)
+        if not ok then handler({ type = 'error', error = err }) end
+        return true
+    end
+    return false
+end
+
+local function clear_attachments(tab)
+    for _, a in ipairs(tab.attachments) do
+        if a.tex then pcall(raygui.unload_texture, a.tex) end
+    end
+    tab.attachments = {}
+end
+
+local function submit()
+    local tab = T()
+    if tab.busy or not tab.sess then return end
+    if not tab.cfg or not tab.cfg.api_key or tab.cfg.api_key == '' then
+        tab.status = '该模型未配置 token'; return
+    end
+    local text = (tab.input or ''):gsub('^%s+', ''):gsub('%s+$', '')
+    if text == '' and #tab.attachments == 0 then return end
+    if text:sub(1, 1) == '/' and handle_slash(text) then return end
+
+    -- With attachments the user turn becomes content BLOCKS: image blocks
+    -- (base64 PNG, the Anthropic image source format) + an optional text block.
+    local content, shown = text, text
+    if #tab.attachments > 0 then
+        content = {}
+        local marks = {}
+        for _, a in ipairs(tab.attachments) do
+            content[#content + 1] = { type = 'image', source = {
+                type = 'base64', media_type = 'image/png',
+                data = xutils.base64_encode(a.png),
+            } }
+            marks[#marks + 1] = string.format('[图片 %d×%d]', a.w, a.h)
+        end
+        if text ~= '' then content[#content + 1] = { type = 'text', text = text } end
+        shown = table.concat(marks, ' ') .. (text ~= '' and ('\n' .. text) or '')
+    end
+
+    add(tab, 'user', shown)
+    clear_attachments(tab)
+    tab.input = ''
+    tab.busy = true
+    tab.status = '思考中'
+    tab.cur = nil
+    local sess = tab.sess
+    local handler = make_on_event(tab, sess)
+    sess.cancelled = nil    -- a previous stop-click must not kill this new turn
+    sess:add_user(content)
+
+    local co = coroutine.create(function()
+        sess:run(handler)
+        pcall(function() sess:save() end)   -- save the session that RAN (the active tab may have changed)
+    end)
+    local ok, err = coroutine.resume(co)
+    if not ok then handler({ type = 'error', error = err }) end
+end
+
+-- Rebuild transcript entries from a loaded session's message history.
+local function rebuild_entries(messages)
+    local entries = {}
+    local function push(role, text) entries[#entries + 1] = { role = role, text = text or '' } end
+    for _, m in ipairs(messages or {}) do
+        if m.role == 'user' then
+            if type(m.content) == 'string' then
+                push('user', m.content)
+            elseif type(m.content) == 'table' then
+                -- Either tool_results (the agent loop's synthetic turns) or a
+                -- real user message of image + text blocks — render both.
+                local parts = {}
+                for _, b in ipairs(m.content) do
+                    if b.type == 'tool_result' then
+                        local c = b.content
+                        if type(c) ~= 'string' then c = '[result]' end
+                        push('tool_result', c)
+                    elseif b.type == 'image' then
+                        parts[#parts + 1] = '[图片]'
+                    elseif b.type == 'text' then
+                        parts[#parts + 1] = b.text or ''
+                    end
+                end
+                if #parts > 0 then push('user', table.concat(parts, '\n')) end
+            end
+        elseif m.role == 'assistant' then
+            if type(m.content) == 'string' then
+                push('assistant', m.content)
+            elseif type(m.content) == 'table' then
+                for _, b in ipairs(m.content) do
+                    if b.type == 'text' then push('assistant', b.text)
+                    elseif b.type == 'tool_use' then push('tool', '> ' .. tostring(b.name) .. '  ' .. compact(b.input)) end
+                end
+            end
+        end
+    end
+    return entries
+end
+
+local function sanitize_label(s)
+    s = tostring(s or ''):gsub('[\r\n;]', ' ')
+    if #s > 56 then s = text.valid_utf8(s:sub(1, 56)) .. '…' end   -- byte cut → fix UTF-8
+    return s
+end
+
+local function refresh_history()   -- reload items; keeps scroll, clears inline modes
+    S.history_items = session.list()
+    S.renaming = nil
+    S.confirm_delete = nil
+    S.menu_item = nil
+end
+
+-- Persist the chosen working dir so the next app launch defaults to it.
+-- Best-effort (same pattern as the theme file); failure is silent.
+local function save_cwd(dir)
+    pcall(function()
+        fs.mkdirp((fs.home():gsub('[/\\]+$', '')) .. '/.xagent')
+        fs.write_file(CWD_FILE, dir)
+    end)
+end
+
+-- Switch the working directory and START A NEW SESSION rooted in it. Keeps the
+-- caller's UTF-8 string as-is (picker/dialog paths are already canonical; see
+-- dir_exists for why we never round-trip the path through cmd's output). The
+-- choice is persisted so the next launch opens its first session here too.
+-- Operates on the ACTIVE tab: each tab has its own working directory.
+local function apply_cwd(dir)
+    dir = tostring(dir or ''):gsub('^%s+', ''):gsub('%s+$', '')
+    if #dir > 3 then dir = dir:gsub('[\\/]+$', '') end   -- keep "C:\" intact
+    if dir ~= '' and dir_exists(dir) then
+        T().cwd = dir
+        skills.bootstrap(dir)   -- reload project skills for the new working dir
+        save_cwd(dir)
+        new_session()           -- immediately switch to a fresh session here (this tab)
+    else
+        print('[xagent] apply_cwd failed for: ' .. dir)   -- diagnosis via xlog
+        T().status = '目录不存在: ' .. dir
+    end
+end
+
+-- Open the directory picker. Primary: the EMBEDDED raygui file dialog
+-- (gui_window_file_dialog compiled into raygui.dll) — in-process, theme-
+-- consistent, no encoding pitfalls. The PowerShell fallback below is kept only
+-- until the embedded one is confirmed good, then deleted.
+local function pick_directory()
+    if raygui.file_dialog_open then
+        if S.dir_dialog then return end
+        -- Open at the drive ROOT, not the cwd: picking a project dir usually
+        -- means navigating somewhere else entirely.
+        local root = IS_WIN and (((T().cwd or ''):match('^%a:') or 'C:') .. '\\') or '/'
+        raygui.file_dialog_open(root, 600, 440, true)    -- dirs only
+        S.dir_dialog = true
+        T().status = '选择目录…（进入目标目录后点 Select）'
+        return
+    end
+    return pick_directory_ps()
+end
+
+-- DEPRECATED fallback: native FolderBrowserDialog via PowerShell on the
+-- subprocess worker. Remove once the embedded dialog is confirmed.
+function pick_directory_ps()
+    if S.picking_dir then return end
+    if not IS_WIN then T().status = 'folder picker: Windows only'; return end
+    S.picking_dir = true
+    T().status = '选择目录中…'
+
+    local preset = (T().cwd or ''):gsub("'", "''")   -- PS single-quote escaping
+    -- The picked path is wrapped in sentinels: powershell.exe serializes its
+    -- progress/error streams as CLIXML (`<Objs Version=...`) onto stderr when
+    -- redirected, and the worker merges stderr into stdout — so the raw output
+    -- can contain arbitrary XML noise around the path. Parse ONLY the
+    -- sentinel-delimited span. ProgressPreference cuts the noise at the source.
+    local ps = "$ProgressPreference='SilentlyContinue'\n" ..
+        "[Console]::OutputEncoding=[Text.Encoding]::UTF8\n" ..
+        "Add-Type -AssemblyName System.Windows.Forms | Out-Null\n" ..
+        "$f = New-Object System.Windows.Forms.FolderBrowserDialog\n" ..
+        "$f.ShowNewFolderButton = $true\n" ..
+        "$f.SelectedPath = '" .. preset .. "'\n" ..
+        "if ($f.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) " ..
+        "{ [Console]::Out.Write('<<PICK>>' + $f.SelectedPath + '<<END>>') }\n"
+    local cmd = 'powershell -NoProfile -STA -EncodedCommand ' ..
+        xutils.base64_encode(utf8_to_utf16le(ps))
+
+    local co = coroutine.create(function()
+        local r = subprocess.run({ cmd = cmd, timeout_ms = 300000 })  -- 5 min to pick
+        S.picking_dir = false
+        local raw = tostring(r and r.stdout or '')
+        local out = raw:match('<<PICK>>(.-)<<END>>')
+        out = out and out:gsub('^%s+', ''):gsub('%s+$', '') or ''
+        if out == '' then T().status = 'ready'; return end   -- dialog cancelled
+        apply_cwd(out)
+    end)
+    local ok, err = coroutine.resume(co)
+    if not ok then
+        S.picking_dir = false
+        T().status = '选择目录失败: ' .. tostring(err)
+    end
+end
+
+-- Toggle a sidebar mode on/off (clicking the active one closes it).
+local function toggle_sidebar(mode)
+    if S.sidebar == mode then S.sidebar = nil; return end
+    if mode == 'history' then refresh_history(); S.history_scroll = 0 end
+    if mode == 'apilog' then S.apilog_scroll = 0; S.apilog_selected = nil end
+    S.sidebar = mode
+end
+
+-- ── API request/response log panel ─────────────────────────────────────────
+-- Insert newlines at structural points of a compact JSON body so it wraps and
+-- reads reasonably. String-aware: breaks are added ONLY outside quoted strings,
+-- so the result is still valid JSON (copyable + parseable), never split mid-value.
+local function reflow_json(s)
+    s = tostring(s or '')
+    local out, oi = {}, 0
+    local instr, esc = false, false
+    for i = 1, #s do
+        local c = s:sub(i, i)
+        oi = oi + 1; out[oi] = c
+        if instr then
+            if esc then esc = false
+            elseif c == '\\' then esc = true
+            elseif c == '"' then instr = false end
+        elseif c == '"' then instr = true
+        elseif c == ',' or c == '{' or c == '[' then
+            oi = oi + 1; out[oi] = '\n'
+        end
+    end
+    return table.concat(out)
+end
+
+local function shorttok(v)
+    if not v then return '?' end
+    if v >= 1000 then return string.format('%.1fk', v / 1000) end
+    return tostring(v)
+end
+
+-- COMPLETE HTTP request as raw text (request line + headers + full body); this is
+-- what the 请求 copy button puts on the clipboard. Auth header is already redacted
+-- in api_log. NOT reflowed — the body is the exact bytes we sent.
+local function http_request_text(rec)
+    local lines = { (rec.method or 'POST') .. ' ' .. tostring(rec.url or '') }
+    if type(rec.headers) == 'table' then
+        local keys = {}
+        for k in pairs(rec.headers) do keys[#keys + 1] = k end
+        table.sort(keys)
+        for _, k in ipairs(keys) do lines[#lines + 1] = k .. ': ' .. tostring(rec.headers[k]) end
+    end
+    lines[#lines + 1] = ''
+    lines[#lines + 1] = rec.request or ''
+    if rec.req_truncated then
+        lines[#lines + 1] = string.format('\n…[请求体过大，已截断；原始 %d 字节]', rec.request_bytes or 0)
+    end
+    return table.concat(lines, '\n')
+end
+
+-- Build the read-only detail "transcript" for one API-log record. The two body
+-- rows carry an explicit copy_text = the COMPLETE raw request / response, so the
+-- 复制 button copies the full original (not the reflowed preview). Other rows opt
+-- out of copy via no_copy.
+local function build_log_detail(rec)
+    local rows = {}
+    local function L(role, t, extra)
+        local row = { role = role, text = t or '' }
+        if extra then for k, v in pairs(extra) do row[k] = v end end
+        rows[#rows + 1] = row
+    end
+    if not rec then return rows end
+
+    L('user', string.format('请求 #%d  ·  %s', rec.seq, os.date('%Y-%m-%d %H:%M:%S', rec.ts)), { no_copy = true })
+    L('system', '')
+
+    -- ── 请求 ── (body row copies the COMPLETE raw HTTP request)
+    L('tool', '请求方法：' .. (rec.method or 'POST'), { no_copy = true })
+    L('tool', '请求地址：' .. tostring(rec.url or ''), { no_copy = true })
+    L('system', '模型：' .. tostring(rec.model or '?'))
+    L('user', '【请求参数】（点“复制”得到完整 HTTP 请求）', { no_copy = true })
+    L('tool_result', (rec.request ~= '' and reflow_json(rec.request)) or '（空）',
+        { copy_text = http_request_text(rec) })
+    if rec.req_truncated then
+        L('system', string.format('… 请求体过大仅截断“显示”，复制仍为完整（原始 %d 字节）', rec.request_bytes or 0))
+    end
+
+    L('system', '')
+    -- ── 返回 ── (body row copies the COMPLETE response incl. full content)
+    if not rec.done then
+        L('tool', '返回状态：进行中…', { no_copy = true })
+    elseif rec.error then
+        L('tool', '返回状态：HTTP ' .. tostring(rec.status or '-') .. '  失败', { no_copy = true })
+        L('error', '错误：' .. tostring(rec.error))
+    else
+        L('tool', string.format('返回状态：HTTP %s  ·  stop=%s  ·  输入 %s / 输出 %s tok  ·  %dms',
+            tostring(rec.status or '-'), tostring(rec.stop_reason or '?'),
+            tostring(rec.usage and rec.usage.input_tokens or '?'),
+            tostring(rec.usage and rec.usage.output_tokens or '?'),
+            rec.elapsed_ms or 0), { no_copy = true })
+    end
+    -- The RAW response body, shown UNPARSED — the exact SSE stream the server
+    -- sent. It already carries every block (text deltas AND tool_use blocks with
+    -- their streamed input), so this single view IS "the complete return". Display
+    -- == copy == the protocol bytes; no extraction, no preview.
+    L('user', '【HTTP 返回 · 原始 SSE】（含 text 与 tool_use；显示=复制=原文）', { no_copy = true })
+    local raw = rec.raw_response
+    L('tool_result',
+        (raw and raw ~= '' and raw)
+        or (not rec.done and '（进行中…）')
+        or '（无原始返回内容；旧记录或重启前发起的请求没有此字段）',
+        { copy_text = (raw and raw ~= '' and raw) or '' })
+    if rec.raw_truncated then L('system', '… 原始返回超过 4MB，显示与复制均已截断') end
+    return rows
+end
+
+-- Select a log record to show in the main area; clicking the active one closes it.
+local function select_log(rec)
+    if S.apilog_selected == rec then rec = nil end
+    S.apilog_selected = rec
+    S.log_detail = build_log_detail(rec)
+    S.log_detail_for = rec
+    S.log_detail_done = rec and rec.done or nil
+    if S.log_view then S.log_view.scroll = 0; S.log_view.follow = false end
+end
+
+-- Load a saved session into the ACTIVE tab (runs under that tab's model).
+local function load_history_item(it)
+    if not it then return end
+    local tab = T()
+    local s2 = session.load(it.path, { cfg = tab.cfg })
+    if not s2 then tab.status = 'load failed'; return end
+    if tab.sess then tab.sess.cancelled = true end   -- stop a still-running turn at its next boundary
+    s2.tools = registry.to_api_params()
+    s2.system = system_prompt.build({ cwd = s2.cwd, project_md = project_md.load(s2.cwd) })
+    s2.max_tokens = MAX_TOKENS
+    s2.confirm = make_confirm(tab, s2)
+    tab.sess = s2
+    tab.cwd = s2.cwd or tab.cwd                   -- this tab follows the resumed session's dir
+    tab.entries = rebuild_entries(s2.messages)
+    tab.cur, tab.text_tail, tab.busy = nil, '', false
+    tab.budget = nil                              -- meter restarts on the next turn
+    tab.pending_confirm = nil
+    S.dir_cache, S.menu, S.menu_dismissed_for = {}, nil, nil   -- @ picker follows the new cwd
+    clear_attachments(tab)
+    S.sidebar = nil
+    tab.status = 'resumed (' .. #s2.messages .. ' msgs)'
+end
+
+local function start_rename(it)
+    S.renaming = it.id
+    S.rename_text = it.title or ''
+    S.rename_edit = true
+    S.confirm_delete = nil
+    S.menu_item = nil
+end
+
+local function do_rename(it)
+    local name = (S.rename_text or ''):gsub('^%s+', ''):gsub('%s+$', '')
+    if name ~= '' then
+        session.rename(it.path, name)
+        for _, tab in ipairs(S.tabs) do
+            if tab.sess and tab.sess.id == it.id then tab.sess.title = name end
+        end
+    end
+    S.renaming = nil
+    refresh_history()
+end
+
+local function do_delete(it)
+    session.delete(it.path)
+    S.confirm_delete = nil
+    refresh_history()
+end
+
+-- Reset the ACTIVE tab to a fresh session (same model + cwd).
+function new_session()
+    local tab = T()
+    if not tab.cfg then return end
+    if tab.sess then tab.sess.cancelled = true end   -- stop a still-running turn at its next boundary
+    local cwd = tab.cwd or (tab.sess and tab.sess.cwd) or '.'
+    tab.sess = session.new({
+        cfg = tab.cfg, cwd = cwd, tools = registry.to_api_params(),
+        system = system_prompt.build({ cwd = cwd, project_md = project_md.load(cwd) }),
+        max_tokens = MAX_TOKENS,
+    })
+    tab.sess.confirm = make_confirm(tab, tab.sess)
+    tab.entries = {}
+    tab.cur, tab.text_tail, tab.busy = nil, '', false
+    tab.budget = nil                             -- meter restarts on the next turn
+    tab.pending_confirm = nil
+    S.dir_cache, S.menu, S.menu_dismissed_for = {}, nil, nil   -- @ picker follows the new cwd
+    clear_attachments(tab)
+    add(tab, 'system', 'new session · ' .. tab.cfg.model .. ' · ' .. cwd .. '\nEnter 发送 · Ctrl+Enter 换行')
+    S.sidebar = nil
+    tab.status = 'new session'
+end
+
+-- Create a new tab bound to `cfg` (a profile) and make it active. `cwd` defaults
+-- to the current tab's working dir (so a new tab opens where you are). Each tab
+-- gets its own session + transcript view; several can run concurrently.
+function new_tab(cfg, cwd)
+    cfg = cfg or (S.profiles and S.profiles[1])
+    if not cfg then return end
+    cwd = cwd or (T() and T().cwd) or '.'
+    local tab = {
+        id = S.next_tab_id,
+        cfg = cfg,
+        entries = {}, cur = nil, text_tail = '',
+        input = '', input_edit = true,
+        busy = false, status = 'ready', budget = nil,
+        pending_confirm = nil, attachments = {},
+        cwd = cwd,
+        view = transcript.new_view({ font_size = FONT_SIZE, raygui = raygui, emoji_tex = S.emoji_tex }),
+    }
+    S.next_tab_id = S.next_tab_id + 1
+    tab.view.bg = S.view_bg
+    tab.view.on_copy = S.on_copy
+    tab.view.on_link = S.on_link
+    skills.bootstrap(cwd)   -- align the (global) project skills with this tab's dir
+    tab.sess = session.new({
+        cfg = cfg, cwd = cwd, tools = registry.to_api_params(),
+        system = system_prompt.build({ cwd = cwd, project_md = project_md.load(cwd) }),
+        max_tokens = MAX_TOKENS,
+    })
+    tab.sess.confirm = make_confirm(tab, tab.sess)
+    S.tabs[#S.tabs + 1] = tab
+    S.active = #S.tabs
+    S.menu, S.menu_sel, S.menu_off, S.menu_dismissed_for = nil, 1, 0, nil
+    if not cfg.api_key or cfg.api_key == '' then
+        add(tab, 'error', '该模型（' .. (cfg.name or cfg.model or '?') ..
+            '）未配置 token：在 xagent.local.cfg 设置 XAGENT_AUTH_TOKEN。')
+    else
+        add(tab, 'system', 'new tab · ' .. (cfg.name or cfg.model) .. ' · ' .. cfg.model ..
+            ' · ' .. cwd .. '\nEnter 发送 · Ctrl+Enter 换行')
+    end
+    return tab
+end
+
+-- Close tab i (cancels its running turn). The last tab can't be closed.
+function close_tab(i)
+    if #S.tabs <= 1 then return end
+    local tab = S.tabs[i]
+    if not tab then return end
+    if tab.sess then tab.sess.cancelled = true end
+    if tab.pending_confirm then                  -- release a parked confirm so the coroutine unwinds
+        local pc = tab.pending_confirm; tab.pending_confirm = nil; pc.resolve(false)
+    end
+    clear_attachments(tab)
+    local was_active = S.active
+    table.remove(S.tabs, i)                      -- the view is plain Lua; GC reclaims it
+    if was_active > i then S.active = was_active - 1
+    elseif was_active == i then S.active = math.min(i, #S.tabs) end
+    if S.active < 1 then S.active = 1 end
+    select_tab(S.active)
+end
+
+-- Switch the active tab; refresh per-tab context (autocomplete + project skills).
+function select_tab(i)
+    if i < 1 or i > #S.tabs then return end
+    S.active = i
+    S.menu, S.menu_sel, S.menu_off, S.menu_dismissed_for = nil, 1, 0, nil
+    local tab = S.tabs[i]
+    if tab and tab.cwd then skills.bootstrap(tab.cwd) end
+end
+
+-- Apply a raygui style and derive matching colors for the custom-drawn areas
+-- (transcript bg/text, markdown palette, role colors) by reading the style's
+-- BACKGROUND/TEXT/accent via get_style. One click re-themes the whole window.
+local function apply_theme(name)
+    pcall(function() require('styles.' .. name).apply(raygui) end)
+    raygui.set_style(raygui.DEFAULT, raygui.TEXT_SIZE, FONT_SIZE)
+    raygui.set_style(raygui.DEFAULT, raygui.TEXT_ALIGNMENT, raygui.TEXT_ALIGN_LEFT)
+    S.theme = name
+
+    local bg     = unpack_color(raygui.get_style(raygui.DEFAULT, raygui.BACKGROUND_COLOR))
+    local txt    = unpack_color(raygui.get_style(raygui.DEFAULT, raygui.TEXT_COLOR_NORMAL))
+    local accent = unpack_color(raygui.get_style(raygui.DEFAULT, raygui.BORDER_COLOR_FOCUSED))
+    local base   = unpack_color(raygui.get_style(raygui.DEFAULT, raygui.BASE_COLOR_NORMAL))
+    local dark   = luma(bg) < 128
+    local muted  = mix(txt, bg, 0.42)
+
+    markdown.palette = {
+        text    = txt,
+        heading = accent,
+        code    = dark and { 130, 205, 150, 255 } or { 22, 120, 66, 255 },
+        bullet  = mix(accent, txt, 0.35),
+        quote   = muted,
+        hr      = mix(txt, bg, 0.62),
+        table   = mix(txt, bg, 0.18),
+    }
+    markdown.code_bg = dark and shift(bg, 16) or shift(bg, -14)
+
+    transcript.role_colors.user        = accent
+    transcript.role_colors.assistant   = txt
+    transcript.role_colors.tool        = dark and { 120, 205, 205, 255 } or { 22, 130, 130, 255 }
+    transcript.role_colors.tool_result = muted
+    transcript.role_colors.system      = muted
+    transcript.role_colors.error       = { 220, 90, 90, 255 }
+
+    S.view_bg = bg
+    S.header_bg = base
+    S.sidebar_bg = shift(bg, dark and 8 or -8)
+    for _, tab in ipairs(S.tabs) do
+        if tab.view then tab.view.bg = bg; tab.view:invalidate() end
+    end
+    if S.log_view then S.log_view.bg = bg; S.log_view:invalidate() end
+
+    pcall(function()
+        fs.mkdirp((fs.home():gsub('[/\\]+$', '')) .. '/.xagent')
+        fs.write_file(THEME_FILE, name)
+    end)
+end
+
+local function get_cwd()
+    local f = io.popen(IS_WIN and 'cd' or 'pwd')
+    if not f then return '.' end
+    local s = (f:read('*a') or '.'):gsub('%s+$', '')
+    f:close()
+    return s
+end
+
+-- ── input autocomplete (/ commands · @ file refs) ───────────────────────────
+-- Immediate children of <cwd>/<rel> (dirs marked with a trailing '/'), reduced
+-- from xutils.scan_dir like the LS tool and cached per resolved directory: the
+-- recursive walk runs once per directory the user drills into, not per keystroke
+-- (files created mid-session won't show until the working dir changes).
+local function list_dir_cached(rel)
+    rel = tostring(rel or '')
+    local base = (T() and T().cwd) or '.'
+    local sub = rel:gsub('[/\\]+$', '')
+    local abs = (sub == '') and base or (base:gsub('[/\\]+$', '') .. '/' .. sub)
+    local hit = S.dir_cache[abs]
+    if hit then return hit end
+    local entries = xutils.scan_dir(abs)
+    local seen, children = {}, {}
+    if entries then
+        for _, e in ipairs(entries) do
+            local r = (e.rel or ''):gsub('\\', '/')
+            local first = r:match('^([^/]+)')
+            if first and first ~= '' then
+                local label = r:find('/') and (first .. '/') or first
+                if not seen[label] then seen[label] = true; children[#children + 1] = label end
+            end
+        end
+    end
+    table.sort(children)
+    S.dir_cache[abs] = children
+    return children
+end
+
+-- The slash-command catalog (built-ins handled by handle_slash + user skills).
+local function slash_items()
+    local items = {
+        { name = 'compact', desc = '压缩上下文' },
+        { name = 'context', desc = '查看上下文用量' },
+        { name = 'mcp',     desc = '查看 MCP 服务器' },
+        { name = 'new',     desc = '新会话' },
+        { name = 'help',    desc = '帮助' },
+    }
+    for _, s in ipairs(skills.all_user_invocable()) do
+        items[#items + 1] = { name = s.name, desc = s.description or '' }
+    end
+    return items
+end
+
+local completion_deps = { slash_items = slash_items, list_dir = list_dir_cached }
+
+-- Recompute S.menu from the current input each frame. NOT gated on input focus:
+-- clicking a popup row defocuses the textbox, and GuiButton fires on mouse
+-- RELEASE, so the menu must survive the press→release of its own click. Token
+-- presence is the gate instead (input is cleared on every session switch, so a
+-- token only ever appears after the user has focused and typed).
+local function update_completion_menu()
+    S.menu = nil
+    local tab = T()
+    if tab.busy or S.dir_dialog or tab.pending_confirm or S.tab_picker or S.add_model then return end
+    local menu = complete.compute(tab.input, completion_deps)
+    if not menu then S.menu_dismissed_for = nil; return end
+    if raygui.is_key_pressed and raygui.is_key_pressed(raygui.KEY_ESCAPE) then
+        S.menu_dismissed_for = tab.input; return     -- Esc hides it until the text changes
+    end
+    if S.menu_dismissed_for == tab.input then return end
+    local n = #menu.items
+    if S.menu_sel < 1 or S.menu_sel > n then S.menu_sel = 1 end
+    if raygui.is_key_pressed then
+        if raygui.is_key_pressed(raygui.KEY_DOWN) then S.menu_sel = S.menu_sel % n + 1 end
+        if raygui.is_key_pressed(raygui.KEY_UP)   then S.menu_sel = (S.menu_sel - 2) % n + 1 end
+    end
+    S.menu = menu
+end
+
+-- Insert the chosen candidate into the input and drop the caret after it.
+local function accept_completion(item)
+    if not S.menu or not item then return end
+    local new_input, caret = complete.apply(S.menu, item)
+    if not new_input then return end
+    T().input = new_input
+    if raygui.set_textbox_cursor then raygui.set_textbox_cursor(caret) end
+    T().input_edit = true                          -- the popup click defocused the box
+    S.menu, S.menu_sel, S.menu_off, S.menu_dismissed_for = nil, 1, 0, nil
+end
+
+-- Render the popup above the input box; handles hover (selects) and click (inserts).
+local function draw_completion_menu(lx, iy, W)
+    local menu = S.menu
+    if not menu then return end
+    local items = menu.items
+    local n = #items
+    local MAXVIS, row_h, head_h = 8, FONT_SIZE + 12, 24
+    local vis = math.min(MAXVIS, n)
+
+    local off = S.menu_off or 0                     -- keep the highlight on-screen
+    if S.menu_sel <= off then off = S.menu_sel - 1 end
+    if S.menu_sel > off + MAXVIS then off = S.menu_sel - MAXVIS end
+    off = math.max(0, math.min(off, math.max(0, n - MAXVIS)))
+    S.menu_off = off
+
+    local px, pw = lx + 8, W - lx - 16
+    local ph = head_h + vis * row_h + 6
+    local py = iy - ph - 6
+
+    local pb = S.sidebar_bg
+    raygui.draw_rectangle(px, py, pw, ph, pb[1], pb[2], pb[3], 250)
+    local ac = (markdown.palette and markdown.palette.heading) or { 110, 170, 120, 255 }
+    raygui.draw_rectangle(px, py, 4, ph, ac[1], ac[2], ac[3], 255)
+
+    local more = (n > vis or items.truncated)
+        and ('   (' .. n .. (items.truncated and '+' or '') .. ')') or ''
+    raygui.label(px + 12, py + 3, pw - 24, 20,
+        ((menu.kind == 'slash') and '命令' or '文件/目录') ..
+        '   ↑↓ 选择 · Enter 插入 · Esc 关闭' .. more)
+
+    local mx, my = raygui.get_mouse()
+    for i = 1, vis do
+        local idx = off + i
+        local it = items[idx]
+        if it then
+            local ry = py + head_h + (i - 1) * row_h
+            if mx >= px and mx <= px + pw and my >= ry and my < ry + row_h then
+                S.menu_sel = idx                    -- hover highlights (Enter takes it)
+            end
+            local label = ((idx == S.menu_sel) and '● ' or '   ') .. sanitize_label(it.label)
+            if menu.kind == 'slash' and it.desc and it.desc ~= '' then
+                label = label .. '    ' .. it.desc
+            end
+            if raygui.button(px + 6, ry, pw - 12, row_h - 4, label) then
+                accept_completion(it)
+            end
+        end
+    end
+end
+
+-- ── tab bar (one tab per conversation; each shows its model) ────────────────
+-- A strip below the top bar: a button per tab (model name + busy dots / '!' when
+-- a confirm is pending), a hover-close '×' (except on the last tab), and a '+'
+-- to open a new tab. Returns having possibly switched/created/closed the active
+-- tab, so the caller re-reads T() afterwards.
+local function draw_tabbar(W)
+    local y = HEADER_H
+    local sb = S.sidebar_bg
+    raygui.draw_rectangle(0, y, W, TABBAR_H, sb[1], sb[2], sb[3], sb[4])
+
+    local n = #S.tabs
+    local plus_w = 30
+    local avail = W - 6 - plus_w - 8
+    local tw = math.max(70, math.min(180, math.floor(avail / math.max(1, n)) - 2))
+    local ry, rh = y + 3, TABBAR_H - 5
+    local x = 6
+    local mx, my = raygui.get_mouse()
+    local ac = (markdown.palette and markdown.palette.heading) or { 110, 170, 120, 255 }
+
+    for i, tab in ipairs(S.tabs) do
+        local active = (i == S.active)
+        local label = (tab.cfg and tab.cfg.name) or '?'
+        if tab.busy then
+            label = label .. ' ' .. ('.'):rep(1 + math.floor(S.frame / 20) % 3)
+        elseif tab.pending_confirm then
+            label = label .. '  !'
+        end
+        local over = my >= ry and my < ry + rh and mx >= x and mx < x + tw
+        local closable = (n > 1 and over)            -- show the close affordance on hover
+        local clicked = raygui.button(x, ry, tw, rh, (active and '● ' or '   ') .. sanitize_label(label))
+        if active then raygui.draw_rectangle(x, ry + rh - 2, tw, 2, ac[1], ac[2], ac[3], 255) end
+        -- The close 'x' is a FRAMELESS icon drawn over the tab's right edge (a
+        -- nested button would draw a second border inside the tab and look
+        -- misaligned). The single tab button handles the click: over the icon →
+        -- close, anywhere else → select.
+        local over_close = false
+        if closable then
+            over_close = mx >= x + tw - 22 and mx < x + tw - 4
+            -- brighten the × when the pointer is right over it
+            local xcol = over_close and { 235, 120, 110, 255 }
+                or (markdown.palette and markdown.palette.text) or { 200, 200, 200, 255 }
+            draw_x(x + tw - 20, ry, 16, rh, xcol)
+        end
+        if clicked then
+            if over_close then close_tab(i); return   -- S.tabs mutated; stop iterating this frame
+            else select_tab(i) end
+        end
+        x = x + tw + 2
+    end
+
+    S.plus_x = x
+    if raygui.button(x, ry, plus_w, rh, '+') then
+        if S.profiles and #S.profiles > 1 then
+            S.tab_picker = not S.tab_picker
+        else
+            new_tab(S.profiles and S.profiles[1]); S.tab_picker = false
+        end
+    end
+end
+
+-- The "+" model-picker popup: one row per configured profile; pick → new tab.
+-- Esc closes it; clicking "+" again toggles it.
+local function draw_tab_picker(W, H)
+    if not S.tab_picker or S.dir_dialog then return end
+    if raygui.is_key_pressed and raygui.is_key_pressed(raygui.KEY_ESCAPE) then
+        S.tab_picker = false; return
+    end
+    local profs = S.profiles or {}
+    local row_h = FONT_SIZE + 14
+    local pw = 340
+    local px = math.max(6, math.min(S.plus_x or 6, W - pw - 8))
+    local py = TOP + 2
+    local ph = 26 + #profs * row_h
+    local pb = S.sidebar_bg
+    raygui.draw_rectangle(px, py, pw, ph, pb[1], pb[2], pb[3], 252)
+    local ac = (markdown.palette and markdown.palette.heading) or { 110, 170, 120, 255 }
+    raygui.draw_rectangle(px, py, 4, ph, ac[1], ac[2], ac[3], 255)
+    raygui.label(px + 12, py + 3, pw - 24, 20, '新建标签 · 选择模型 · Esc 关闭')
+    for i, p in ipairs(profs) do
+        local ry = py + 24 + (i - 1) * row_h
+        local host = ((p.base_url or ''):gsub('^https?://', '')):match('^([^/]+)') or ''
+        local lbl = '  ' .. sanitize_label(p.name or p.model or '?')
+        if host ~= '' then lbl = lbl .. '    · ' .. host end
+        if raygui.button(px + 6, ry, pw - 12, row_h - 4, lbl) then
+            new_tab(p); S.tab_picker = false
+        end
+    end
+end
+
+-- ── settings page: dropdowns + add-model form ──────────────────────────────
+local function reload_profiles()
+    S.profiles = config.load_profiles()
+    if S.model_sel < 1 then S.model_sel = 1 end
+    if S.model_sel > #S.profiles then S.model_sel = #S.profiles end
+end
+
+-- A dropdown trigger: a button + a caret. Records its anchor while open so the
+-- popup list (drawn on top of everything at frame end) knows where to appear.
+local function dropdown_button(id, x, y, w, h, current)
+    local open = (S.dd_open == id)
+    local clicked = raygui.button(x, y, w, h, '  ' .. sanitize_label(current or '（无）'))
+    local col = (markdown.palette and markdown.palette.text) or { 200, 200, 200, 255 }
+    draw_caret(x + w - 14, y + h / 2, col, open)
+    if clicked then S.dd_open = open and nil or id end
+    if S.dd_open == id then S.dd_anchor = { x = x, y = y, w = w, h = h } end
+end
+
+-- Draw the open dropdown's list (theme or model) over the rest of the UI.
+-- `was_open` is S.dd_open as of frame start (before any control could toggle it),
+-- so the click that OPENS the dropdown this frame isn't read as an outside-click.
+local function draw_dropdown_overlays(was_open)
+    if not S.dd_open or not S.dd_anchor then S.dd_prev_down = false; return end
+    raygui.unlock()                       -- background was locked while a dropdown is open
+    if S.sidebar ~= 'settings' then S.dd_open = nil; return end
+    if raygui.is_key_pressed and raygui.is_key_pressed(raygui.KEY_ESCAPE) then
+        S.dd_open = nil; return
+    end
+    local items = {}
+    if S.dd_open == 'theme' then
+        for _, t in ipairs(THEMES) do items[#items + 1] = { label = t, cur = (t == S.theme) } end
+    elseif S.dd_open == 'model' then
+        for i, p in ipairs(S.profiles or {}) do
+            items[#items + 1] = { label = p.name or p.model or '?', cur = (i == S.model_sel) }
+        end
+    end
+    if #items == 0 then S.dd_open = nil; return end
+    local a = S.dd_anchor
+    local row_h = FONT_SIZE + 10
+    local px, pw, py = a.x, a.w, a.y + a.h + 2
+    local ph = 6 + #items * row_h
+    local pb = S.sidebar_bg
+    raygui.draw_rectangle(px, py, pw, ph, pb[1], pb[2], pb[3], 252)
+    local ac = (markdown.palette and markdown.palette.heading) or { 110, 170, 120, 255 }
+    raygui.draw_rectangle(px, py, 3, ph, ac[1], ac[2], ac[3], 255)
+    for i, it in ipairs(items) do
+        local ry = py + 3 + (i - 1) * row_h
+        if raygui.button(px + 4, ry, pw - 8, row_h - 3,
+                (it.cur and '● ' or '   ') .. sanitize_label(it.label)) then
+            if S.dd_open == 'theme' then apply_theme(it.label)
+            elseif S.dd_open == 'model' then S.model_sel = i end
+            S.dd_open = nil
+        end
+    end
+
+    -- Dismiss on a press that lands outside both the list and its trigger button.
+    -- The background is locked, so this click is consumed purely to close (it does
+    -- not also activate whatever sits underneath). Press-EDGE only (down this
+    -- frame, up last), and gated on `was_open` so the opening click — which is a
+    -- press over the trigger that this same frame set S.dd_open — never self-closes.
+    local down = (raygui.mouse_down and raygui.mouse_down()) or false
+    local press = down and not S.dd_prev_down
+    S.dd_prev_down = down
+    if was_open and press and S.dd_open then
+        local mx, my = raygui.get_mouse()
+        local in_list = mx >= px and mx <= px + pw and my >= py and my <= py + ph
+        local in_trig = mx >= a.x and mx <= a.x + a.w and my >= a.y and my <= a.y + a.h
+        if not in_list and not in_trig then S.dd_open = nil end
+    end
+end
+
+local function open_add_model()
+    S.dd_open = nil
+    S.add_model = { name = '', url = 'https://', model = '', token = '',
+                    name_e = false, url_e = false, model_e = false, token_e = false, err = nil }
+end
+
+-- A centered modal to add a model (persisted to ~/.xagent/models.json). Only
+-- URL + 模型ID are required; auth_style is auto (x-api-key). Esc / 取消 closes.
+local function draw_add_model_modal(W, H)
+    local f = S.add_model
+    if not f then return end
+    if raygui.is_key_pressed and raygui.is_key_pressed(raygui.KEY_ESCAPE) then
+        S.add_model = nil; return
+    end
+    local mw, mh = 520, 300
+    local mx, my = math.floor((W - mw) / 2), math.floor((H - mh) / 2)
+    raygui.draw_rectangle(mx - 2, my - 2, mw + 4, mh + 4, 0, 0, 0, 170)   -- shadow/border
+    local pb = S.sidebar_bg
+    raygui.draw_rectangle(mx, my, mw, mh, pb[1], pb[2], pb[3], 255)
+    local ac = (markdown.palette and markdown.palette.heading) or { 110, 170, 120, 255 }
+    raygui.draw_rectangle(mx, my, mw, 3, ac[1], ac[2], ac[3], 255)
+    raygui.label(mx + 16, my + 12, mw - 32, 24, '新增模型（鉴权方式自动 = x-api-key）')
+
+    local pad, lblw = 16, 84
+    local fx = mx + pad + lblw + 8
+    local fw = mw - (pad + lblw + 8) - pad
+    local rh, row = 30, my + 48
+    local function fld(label, id)
+        raygui.label(mx + pad, row + 4, lblw, 22, label)
+        f[id], f[id .. '_e'] = raygui.textbox(fx, row, fw, rh - 4, f[id], f[id .. '_e'])
+        row = row + rh + 6
+    end
+    fld('名称', 'name')
+    fld('API地址', 'url')
+    fld('模型ID', 'model')
+    fld('Token', 'token')
+
+    if f.err then
+        local ec = { 220, 90, 90, 255 }
+        raygui.draw_rectangle(mx + pad, row, 6, 6, ec[1], ec[2], ec[3], 255)
+        raygui.label(mx + pad + 12, row - 4, mw - 2 * pad - 12, 22, f.err)
+    end
+
+    if raygui.button(mx + mw - 16 - 96 - 8 - 96, my + mh - 44, 96, 30, '保存') then
+        local url = (f.url or ''):gsub('^%s+', ''):gsub('%s+$', '')
+        local model = (f.model or ''):gsub('^%s+', ''):gsub('%s+$', '')
+        if url == '' or url == 'https://' or model == '' then
+            f.err = '请至少填写 API地址 和 模型ID'
+        else
+            config.add_user_model({ name = (f.name or ''):gsub('^%s+', ''):gsub('%s+$', ''),
+                base_url = url, model = model,
+                api_key = (f.token or ''):gsub('^%s+', ''):gsub('%s+$', '') })
+            reload_profiles()
+            S.model_sel = #S.profiles      -- select the model just added
+            S.add_model = nil
+            if T() then T().status = '已添加模型' end
+        end
+    end
+    if raygui.button(mx + mw - 16 - 96, my + mh - 44, 96, 30, '取消') then S.add_model = nil end
+end
+
+local function __init()
+    S.profiles = config.load_profiles()
+    assert(xnet.init())
+    assert(subprocess.setup())
+
+    raygui.init(960, 700, 'xagent')
+    -- Pre-seed glyphs (eliminates streaming flicker); fall back to ASCII-only.
+    if not raygui.load_system_font(FONT_SIZE, preseed_charset()) and
+       not raygui.load_font('tools/fonts/NotoSansSC-Regular.otf', FONT_SIZE, preseed_charset()) then
+        raygui.load_font('tools/fonts/NotoSansSC-Regular.otf', FONT_SIZE)
+    end
+
+    -- Color emoji come from the atlas (the font has no emoji glyphs).
+    S.emoji_tex = raygui.load_texture('tools/emoji_atlas.png')
+    -- Copy puts the RAW source on the clipboard, never the rendered/reflowed text:
+    -- entry.copy_text (explicit raw payload) wins, else entry.text (raw Markdown).
+    -- Shared by every tab's view (set via S.on_copy in new_tab).
+    local function copy_entry(entry)
+        raygui.set_clipboard(entry.copy_text or entry.text or '')
+        if T() then T().status = 'copied ✓' end
+    end
+    S.on_copy = copy_entry
+
+    -- Click a URL in the transcript to open it in the default browser.
+    -- Restrict to web/file schemes for safety.
+    local function open_link(url)
+        local scheme = tostring(url or ''):match('^(%a[%w%+%.%-]*)://')
+        if scheme == 'http' or scheme == 'https' or scheme == 'file' then
+            open_url.open(url)
+            if T() then T().status = '已打开链接 ↗' end
+        end
+    end
+    S.on_link = open_link
+
+    -- A second view renders the selected API-log record's request/response detail.
+    S.log_view = transcript.new_view({ font_size = FONT_SIZE, raygui = raygui,
+        emoji_tex = S.emoji_tex, anchor_top = true })
+    S.log_view.on_copy = copy_entry
+    S.log_view.on_link = open_link
+
+    -- Apply the saved (or default) color theme (sets S.view_bg for new tabs).
+    local saved = fs.read_file(THEME_FILE)
+    saved = saved and saved:gsub('%s+', '')
+    apply_theme((saved and saved ~= '') and saved or 'nord')
+
+    -- Default the first tab's dir to the last picked one (persisted across
+    -- launches); fall back to the process cwd if none saved or it's gone.
+    local cwd = get_cwd()
+    local savedcwd = fs.read_file(CWD_FILE)
+    savedcwd = savedcwd and savedcwd:gsub('^%s+', ''):gsub('%s+$', '')
+    if savedcwd and savedcwd ~= '' and dir_exists(savedcwd) then cwd = savedcwd end
+
+    -- First tab (base profile). new_tab handles skills.bootstrap + the no-token
+    -- case (it adds an error entry but keeps the UI alive instead of returning).
+    new_tab(S.profiles[1], cwd)
+    local pmd = project_md.load(cwd)
+    if pmd and T().cfg.api_key and T().cfg.api_key ~= '' then
+        add(T(), 'system', '（已加载 project memory）')
+    end
+    S.started = true
+
+    -- Bring up MCP servers in the background. The handshake awaits the network,
+    -- so it runs as a coroutine that the event loop resumes between frames; tools
+    -- register globally, so we refresh every live tab's tools param when done
+    -- (new/resumed sessions pick them up automatically at creation).
+    S.mcp_status = 'connecting'
+    local boot_co = coroutine.create(function()
+        -- bootstrap is best-effort (no throws): bad config / failed servers are
+        -- collected into summary.errors, never raised. It awaits the network, so
+        -- it isn't wrapped in pcall (yielding across pcall isn't safe on every
+        -- Lua backend); a stray error surfaces via the resume check below or, on
+        -- a later resume, xasync's resume-error log.
+        local summary = mcp.bootstrap(cwd, { verify = S.profiles[1].verify })
+        S.mcp_status = 'ready'
+        if summary.tool_count > 0 then
+            for _, tab in ipairs(S.tabs) do
+                if tab.sess then tab.sess.tools = registry.to_api_params() end
+            end
+            add(T(), 'system', string.format('✓ MCP：%d 个服务器已连接，新增 %d 个工具',
+                summary.connected, summary.tool_count))
+        elseif summary.connected > 0 then
+            add(T(), 'system', string.format('✓ MCP：%d 个服务器已连接（无工具）', summary.connected))
+        end
+        for _, e in ipairs(summary.errors) do add(T(), 'error', 'MCP: ' .. tostring(e)) end
+    end)
+    local ok, err = coroutine.resume(boot_co)
+    if not ok then S.mcp_status = 'error'; add(T(), 'error', 'MCP 启动失败: ' .. tostring(err)) end
+end
+
+local function __update()
+    if raygui.should_close() then xthread.stop(0); return end
+    local tab = T()
+    if not tab then return end
+
+    local W, H = raygui.screen_size()
+    raygui.begin()
+
+    -- Capture the dropdown's open-state BEFORE any control this frame can toggle
+    -- it: the click that OPENS a dropdown must not also be read as the outside-
+    -- click that closes it (see draw_dropdown_overlays).
+    local dd_open_at_start = S.dd_open
+
+    -- directory dialog open: freeze the UI underneath (raygui controls via
+    -- lock; custom-drawn transcript/list wheel via flags). Unlocked again just
+    -- before the dialog itself is drawn at the end of the frame.
+    if S.dir_dialog or S.add_model or S.dd_open then raygui.lock() end
+    tab.view.lock_input = (S.dir_dialog or S.add_model or S.dd_open) or nil
+
+    -- top bar: title/status + context meter + settings + history toggles
+    S.frame = S.frame + 1
+    update_thinking(tab)   -- maintain the transient "thinking…" transcript line
+    local hb = S.header_bg
+    raygui.draw_rectangle(0, 0, W, HEADER_H, hb[1], hb[2], hb[3], hb[4])
+    local status_text = tab.status
+    if tab.busy then   -- thinking dots: . .. ... cycling (~3 steps/second)
+        status_text = status_text .. ' ' .. ('.'):rep(1 + math.floor(S.frame / 20) % 3)
+    end
+    raygui.label(12, 8, W - 406, 24, 'xagent  ·  ' ..
+        (tab.cfg and tab.cfg.model or '?') .. '  ·  ' .. status_text)
+
+    -- tool permission mode toggle (Write = auto-run · Ask = confirm each write)
+    if raygui.button(W - 386, 6, 70, 28, S.mode == 'ask' and 'Ask' or 'Write') then
+        S.mode = (S.mode == 'ask') and 'write' or 'ask'
+        tab.status = (S.mode == 'ask') and '询问模式：写操作前确认' or '写入模式：自动执行'
+    end
+
+    -- context-usage meter: token count + a thin bar filling toward the window.
+    -- Green normally, amber on 'warning', red on 'error'/'blocking' (compaction
+    -- imminent / just happened).
+    local b = tab.budget
+    if b then
+        local mw, mx, my, mh = 96, W - 238, 15, 8
+        local kt = b.estimated >= 1000 and string.format('%.1fk', b.estimated / 1000)
+            or tostring(b.estimated)
+        raygui.label(mx - 70, 8, 66, 24, kt .. ' tok')
+        local pct = math.min(1, b.percent or 0)
+        local fill = { 110, 170, 120, 255 }
+        if b.state == 'warning' then fill = { 210, 175, 70, 255 }
+        elseif b.state ~= 'normal' then fill = { 215, 95, 85, 255 } end
+        local trk = mix(S.view_bg or { 40, 40, 40, 255 },
+            transcript.role_colors.system or { 120, 120, 120, 255 }, 0.5)
+        raygui.draw_rectangle(mx, my, mw, mh, trk[1], trk[2], trk[3], 255)
+        raygui.draw_rectangle(mx, my, math.floor(mw * pct), mh, fill[1], fill[2], fill[3], 255)
+    end
+
+    if raygui.button(W - 130, 6, 38, 28, '#141#') then toggle_sidebar('settings') end  -- gear
+    if raygui.button(W - 88, 6, 38, 28, '#139#') then toggle_sidebar('history') end    -- clock
+    if raygui.button(W - 46, 6, 38, 28, '#171#') then toggle_sidebar('apilog') end     -- link-net: API log
+
+    -- tab strip (below the top bar); may switch/create/close the active tab
+    draw_tabbar(W)
+    tab = T()
+
+    -- left sidebar (inline, default hidden); shifts the main area right
+    local lx = 0
+    if S.sidebar then
+        lx = SIDEBAR_W
+        local sb = S.sidebar_bg
+        raygui.draw_rectangle(0, TOP, SIDEBAR_W, H - TOP, sb[1], sb[2], sb[3], sb[4])
+        if S.sidebar == 'history' then
+            raygui.label(10, TOP + 6, SIDEBAR_W - 90, 22, '历史会话')
+            if raygui.button(SIDEBAR_W - 78, TOP + 4, 70, 26, '新会话') then new_session() end
+
+            -- this tab's working directory (new sessions start here); clicking it
+            -- opens the NATIVE folder picker (async — the GUI keeps rendering)
+            if raygui.button(8, TOP + 34, SIDEBAR_W - 16, 26,
+                '◇ ' .. sanitize_label(dir_tail(tab.cwd)) ..
+                (S.picking_dir and '  ·  选择中…' or '  ·  点击切换目录')) then
+                pick_directory()
+            end
+
+            -- group sessions by working directory (first appearance ≈ recency)
+            local items = S.history_items
+            local rows, groups = {}, {}
+            for _, it in ipairs(items) do
+                local key = dir_key(it.cwd or '?')
+                local g = groups[key]
+                if not g then
+                    g = { dir = it.cwd or '?', items = {} }
+                    groups[key] = g
+                    rows[#rows + 1] = { header = g }
+                end
+                g.items[#g.items + 1] = it
+            end
+            do  -- flatten: header rows interleaved with their item rows
+                local flat = {}
+                for _, r in ipairs(rows) do
+                    flat[#flat + 1] = r
+                    for _, it in ipairs(r.header.items) do flat[#flat + 1] = { item = it } end
+                end
+                rows = flat
+            end
+
+            local list_top = TOP + 68
+            local view_h = H - list_top - 8
+            local row_h = FONT_SIZE + 16
+            local max_scroll = math.max(0, #rows * row_h - view_h)
+
+            -- natural pixel scroll (only when the pointer is over the list;
+            -- suppressed while the directory dialog overlays the UI)
+            local mx, my = raygui.get_mouse()
+            local over_list = not S.dir_dialog and mx >= 0 and mx <= SIDEBAR_W
+                and my >= list_top and my <= list_top + view_h
+            if over_list then
+                local d = raygui.get_wheel()
+                if d ~= 0 then S.history_scroll = S.history_scroll - d * row_h * 1.5; S.menu_item = nil end
+            end
+            if S.history_scroll > max_scroll then S.history_scroll = max_scroll end
+            if S.history_scroll < 0 then S.history_scroll = 0 end
+
+            if #items == 0 then
+                raygui.label(10, list_top + 6, SIDEBAR_W - 20, 22, '（暂无会话）')
+            else
+                local kw = 26                              -- ⋮ / icon button width
+                local title_w = SIDEBAR_W - 16             -- FULL width; ⋮ overlays on hover
+                local kx = SIDEBAR_W - 8 - kw              -- right-edge button
+                local kx2 = SIDEBAR_W - 8 - 2 * kw - 4     -- second-from-right button
+                -- virtualize: only rows near the viewport; the scissor clips the edges.
+                local first = math.max(1, math.floor(S.history_scroll / row_h) - 2)
+                local last  = math.min(#rows, math.floor((S.history_scroll + view_h) / row_h) + 3)
+
+                raygui.begin_scissor(0, list_top, SIDEBAR_W, view_h)
+                for i = first, last do
+                    local row = rows[i]
+                    local ry = list_top + (i - 1) * row_h - S.history_scroll
+                    if ry + row_h > list_top and ry < list_top + view_h then   -- skip fully off-screen
+                        local rh = row_h - 5
+                        if row.header then
+                            -- directory group header; click switches this tab's dir
+                            local cur = dir_key(row.header.dir) == dir_key(tab.cwd)
+                            if raygui.button(8, ry, title_w, rh,
+                                -- ◆ not ▸: NotoSansSC lacks U+25B8 (renders '?');
+                                -- GB2312 geometric shapes (●◆◇○) are always present
+                                (cur and '● ' or '◆ ') .. sanitize_label(dir_tail(row.header.dir))) then
+                                apply_cwd(row.header.dir)
+                            end
+                        else
+                            local it = row.item
+                            if it.id == S.renaming then
+                                S.rename_text, S.rename_edit = raygui.textbox(8, ry, title_w - 2 * kw - 8, rh, S.rename_text, S.rename_edit)
+                                if raygui.button(kx2, ry, kw, rh, '#112#') then do_rename(it) end        -- ✓ 保存
+                                if raygui.button(kx, ry, kw, rh, '#113#') then S.renaming = nil end       -- ✗ 取消
+                            elseif it.id == S.confirm_delete then
+                                raygui.label(12, ry + 4, title_w - 2 * kw - 30, rh, '删除？')
+                                if raygui.button(kx2, ry, kw, rh, '#112#') then do_delete(it) end         -- ✓ 确认删除
+                                if raygui.button(kx, ry, kw, rh, '#113#') then S.confirm_delete = nil end  -- ✗ 取消
+                            elseif S.menu_item == it then
+                                -- ⋮ clicked: reveal 修改 / 删除 on this row
+                                local bw = (title_w - kw - 8) / 2
+                                if raygui.button(8, ry, bw, rh, '修改') then start_rename(it) end
+                                if raygui.button(8 + bw + 4, ry, bw, rh, '删除') then
+                                    S.confirm_delete = it.id; S.renaming = nil; S.menu_item = nil
+                                end
+                                if kebab_button(kx, ry, kw, rh, markdown.palette.text) then S.menu_item = nil end   -- 再点收起
+                            else
+                                -- full-width title; the ⋮ OVERLAYS its right edge on hover,
+                                -- so a click there must not also load the session.
+                                local over_row = over_list and my >= ry and my < ry + rh
+                                local over_kebab = over_row and mx >= kx and mx < kx + kw
+                                local clicked = raygui.button(8, ry, title_w, rh, '   ○  ' .. sanitize_label(it.title))
+                                if over_row then
+                                    if kebab_button(kx, ry, kw, rh, markdown.palette.text) then S.menu_item = it end
+                                end
+                                if clicked and not over_kebab then load_history_item(it) end
+                            end
+                        end
+                    end
+                end
+                raygui.end_scissor()
+            end
+        elseif S.sidebar == 'apilog' then
+            raygui.label(10, TOP + 6, SIDEBAR_W - 90, 22, 'API 记录')
+            if raygui.button(SIDEBAR_W - 78, TOP + 4, 70, 26, '清空') then
+                api_log.clear(); S.apilog_selected = nil
+                S.log_detail = nil; S.log_detail_for = nil
+            end
+            raygui.label(10, TOP + 34, SIDEBAR_W - 20, 20, '点击条目查看 请求/返回 详情（重启清空）')
+
+            local recs = api_log.list()
+            local n = #recs
+            local list_top = TOP + 60
+            local view_h = H - list_top - 8
+            local row_h = FONT_SIZE + 18
+            local max_scroll = math.max(0, n * row_h - view_h)
+
+            local mx, my = raygui.get_mouse()
+            local over = not S.dir_dialog and mx >= 0 and mx <= SIDEBAR_W
+                and my >= list_top and my <= list_top + view_h
+            if over then
+                local d = raygui.get_wheel()
+                if d ~= 0 then S.apilog_scroll = S.apilog_scroll - d * row_h * 1.5 end
+            end
+            if S.apilog_scroll > max_scroll then S.apilog_scroll = max_scroll end
+            if S.apilog_scroll < 0 then S.apilog_scroll = 0 end
+
+            if n == 0 then
+                raygui.label(10, list_top + 6, SIDEBAR_W - 20, 22, '（暂无请求记录）')
+            else
+                raygui.begin_scissor(0, list_top, SIDEBAR_W, view_h)
+                for i = 1, n do
+                    local rec = recs[n - i + 1]          -- newest first
+                    local ry = list_top + (i - 1) * row_h - S.apilog_scroll
+                    if ry + row_h > list_top and ry < list_top + view_h then
+                        local icon = (not rec.done) and '○' or (rec.error and '×' or '✓')
+                        local lbl
+                        if rec.done and not rec.error then
+                            lbl = string.format('%s #%d %s  %s→%s', icon, rec.seq, os.date('%H:%M:%S', rec.ts),
+                                shorttok(rec.usage and rec.usage.input_tokens),
+                                shorttok(rec.usage and rec.usage.output_tokens))
+                        elseif rec.error then
+                            lbl = string.format('%s #%d %s  失败', icon, rec.seq, os.date('%H:%M:%S', rec.ts))
+                        else
+                            lbl = string.format('%s #%d %s  …', icon, rec.seq, os.date('%H:%M:%S', rec.ts))
+                        end
+                        lbl = (rec == S.apilog_selected and '● ' or '   ') .. lbl
+                        if raygui.button(8, ry, SIDEBAR_W - 16, row_h - 5, lbl) then select_log(rec) end
+                    end
+                end
+                raygui.end_scissor()
+            end
+        else -- settings
+            local pad = 12
+            -- 配色方案 dropdown
+            raygui.label(pad, TOP + 6, SIDEBAR_W - 2 * pad, 22, '配色方案')
+            dropdown_button('theme', pad, TOP + 30, SIDEBAR_W - 2 * pad, 30, S.theme)
+
+            -- 模型 dropdown + 添加 按钮（添加打开表单，可填 URL/Token）
+            local my0 = TOP + 74
+            raygui.label(pad, my0, SIDEBAR_W - 2 * pad, 22, '模型')
+            local nprof = #(S.profiles or {})
+            if S.model_sel < 1 then S.model_sel = 1 end
+            if S.model_sel > nprof then S.model_sel = math.max(1, nprof) end
+            local selp = (S.profiles or {})[S.model_sel]
+            local addw = 56
+            local ddw = SIDEBAR_W - 2 * pad - addw - 6
+            dropdown_button('model', pad, my0 + 24, ddw, 30, selp and (selp.name or selp.model) or '（无）')
+            if raygui.button(pad + ddw + 6, my0 + 24, addw, 30, '添加') then open_add_model() end
+
+            -- selected model details (+ delete for user-added ones)
+            local dy = my0 + 64
+            if selp then
+                local function det(s) raygui.label(pad, dy, SIDEBAR_W - 2 * pad, 20, s); dy = dy + 22 end
+                det('地址: ' .. sanitize_label(selp.base_url or '?'))
+                det('模型: ' .. sanitize_label(selp.model or '?'))
+                det('鉴权: ' .. tostring(selp.auth_style or 'x-api-key'))
+                det('来源: ' .. (selp.source == 'json' and '自定义（可删除）' or '配置文件'))
+                det('Token: ' .. ((selp.api_key and selp.api_key ~= '') and '已设置' or '未设置'))
+                if selp.source == 'json' and selp.json_index then
+                    dy = dy + 4
+                    if raygui.button(pad, dy, 120, 28, '删除此模型') then
+                        config.delete_user_model(selp.json_index)
+                        reload_profiles()
+                    end
+                end
+            end
+        end
+    end
+
+    -- transcript (right of the sidebar); attachments shrink it a bit more
+    local input_h = 96
+    local att_h = (#tab.attachments > 0) and 58 or 0
+    local tx, ty = lx + 8, TOP + 4
+    local tw, th = W - lx - 16, H - ty - input_h - att_h - 12
+    if S.sidebar == 'apilog' and S.apilog_selected then
+        local rec = S.apilog_selected
+        -- rebuild the detail if the record finished since it was first shown
+        if S.log_detail_for ~= rec or S.log_detail_done ~= rec.done then
+            S.log_detail = build_log_detail(rec)
+            S.log_detail_for = rec
+            S.log_detail_done = rec.done
+        end
+        S.log_view:draw(S.log_detail, tx, ty, tw, th)
+    else
+        tab.view:draw(tab.entries, tx, ty, tw, th)
+    end
+
+    -- attachment strip: pasted images as thumbnails, each with a ✗ to remove
+    if att_h > 0 then
+        local ax, ay, thumb = lx + 8, H - input_h - att_h - 2, 48
+        local remove_i
+        for i, a in ipairs(tab.attachments) do
+            local tw2 = math.max(24, math.min(96, math.floor(thumb * a.w / a.h + 0.5)))
+            if a.tex then raygui.draw_texture(a.tex, ax, ay + 4, tw2, thumb) end
+            if raygui.button(ax + tw2 - 16, ay + 4, 16, 16, '#113#') then remove_i = i end
+            ax = ax + tw2 + 10
+        end
+        raygui.label(ax + 4, ay + 16, 220, 22, #tab.attachments .. ' 张图片将随消息发送')
+        if remove_i then
+            local a = table.remove(tab.attachments, remove_i)
+            if a and a.tex then pcall(raygui.unload_texture, a.tex) end
+        end
+    end
+
+    -- input: Enter sends, Ctrl+Enter inserts a newline (no Send button).
+    -- textbox_multi reads raw keys (not raygui-locked), so its edit mode is
+    -- forced off while the directory dialog is open.
+    local iy = H - input_h - 4
+    local submitted, new_edit
+    tab.input, new_edit, submitted = raygui.textbox_multi(
+        lx + 8, iy, W - lx - 16, input_h, tab.input,
+        (not S.dir_dialog and not S.add_model and not S.dd_open) and tab.input_edit or false, true)
+
+    -- live / @ autocomplete menu, recomputed from the (possibly edited) input
+    update_completion_menu()
+
+    if not S.dir_dialog then
+        tab.input_edit = new_edit
+        if submitted then
+            if S.menu then
+                -- Enter inserts the highlighted candidate — except when the user
+                -- already typed a full slash command verbatim, then just run it.
+                local it = S.menu.items[S.menu_sel]
+                if S.menu.kind == 'slash' and it and ('/' .. it.name) == tab.input then
+                    submit()
+                else
+                    accept_completion(it)
+                end
+            else
+                submit()
+            end
+        end
+    end
+
+    -- popup is drawn above the input box (after focus handling, so a row click
+    -- can re-focus the box); only shows while a / or @ token is present
+    draw_completion_menu(lx, iy, W)
+    -- the "+" new-tab model picker (anchored under the tab bar)
+    draw_tab_picker(W, H)
+
+    -- while running: a stop square overlays the input's top-right corner
+    -- (clicking requests cancellation at the next turn boundary)
+    if tab.busy then
+        local sb = 26
+        if stop_button(W - 14 - sb, iy + 6, sb, sb, { 215, 95, 85, 255 }) then
+            if tab.sess then tab.sess.cancelled = true end
+            -- release a parked confirm (as a deny) so the loop can reach its
+            -- next cancellation boundary instead of hanging on the prompt
+            if tab.pending_confirm then
+                local pc = tab.pending_confirm; tab.pending_confirm = nil; pc.resolve(false)
+            end
+            tab.status = '停止中'
+        end
+    end
+
+    -- "ask" mode: a state-changing tool is parked awaiting the user's decision
+    -- (for the ACTIVE tab; a background tab shows '!' on its tab button instead).
+    -- A strip above the input shows the tool + args with 允许 / 拒绝.
+    if tab.pending_confirm then
+        local pc = tab.pending_confirm
+        local bx, bw, bh = lx + 8, W - lx - 16, 86
+        local by = iy - bh - 6
+        local pb = S.sidebar_bg
+        raygui.draw_rectangle(bx, by, bw, bh, pb[1], pb[2], pb[3], 255)
+        local ac = (markdown.palette and markdown.palette.heading) or { 210, 175, 70, 255 }
+        raygui.draw_rectangle(bx, by, 4, bh, ac[1], ac[2], ac[3], 255)
+        raygui.label(bx + 14, by + 8, bw - 28, 22, '询问模式 · 是否执行此工具调用？')
+        raygui.label(bx + 14, by + 32, bw - 28, 22,
+            (pc.req and pc.req.name or '?') .. '   ' .. compact(pc.req and pc.req.input or {}))
+        -- clear BEFORE resolve: resolve resumes the agent, which may immediately
+        -- park the NEXT tool's confirm into tab.pending_confirm.
+        if raygui.button(bx + bw - 188, by + bh - 34, 86, 28, '允许') then
+            tab.pending_confirm = nil; pc.resolve(true)
+        end
+        if raygui.button(bx + bw - 96, by + bh - 34, 86, 28, '拒绝') then
+            tab.pending_confirm = nil; pc.resolve(false)
+        end
+    end
+
+    -- Ctrl+V with an image on the clipboard (flag set inside textbox_multi):
+    -- grab it as PNG, make a thumbnail texture, queue as an attachment.
+    local png, pw, ph = raygui.take_pasted_image()
+    if png then
+        local tex = raygui.load_texture_mem(png)
+        tab.attachments[#tab.attachments + 1] = { png = png, w = pw, h = ph, tex = tex }
+        tab.status = '已附加图片 ' .. pw .. '×' .. ph
+    end
+
+    -- directory dialog: drawn LAST (on top of everything), after unlocking —
+    -- the lock above only freezes the UI underneath it.
+    if S.dir_dialog then
+        raygui.unlock()
+        local status, dir = raygui.file_dialog()
+        if status == 'select' then
+            S.dir_dialog = false
+            if dir == '::' then          -- Select pressed on the drive-list view
+                tab.status = 'ready'
+            else
+                apply_cwd(dir)           -- dir pick: current dialog directory; file ignored
+            end
+        elseif status ~= 'active' then
+            S.dir_dialog = false
+            tab.status = 'ready'
+        end
+    end
+
+    -- add-model modal: drawn LAST, after unlocking (same pattern as the dialog).
+    if S.add_model then
+        raygui.unlock()
+        draw_add_model_modal(W, H)
+    end
+
+    -- open dropdown list: topmost overlay; unlocks the background it was drawn over.
+    draw_dropdown_overlays(dd_open_at_start)
+
+    raygui.finish()
+end
+
+local function __uninit()
+    if S.started then raygui.close() end
+    if xnet and xnet.uninit then xnet.uninit() end
+end
+
+return {
+    __tick_ms = 16,
+    __thread_handle = router.handle,
+    __init = __init,
+    __update = __update,
+    __uninit = __uninit,
+}
