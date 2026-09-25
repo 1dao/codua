@@ -175,7 +175,7 @@ function M.infer_auth_style(url, api_format)
 end
 
 -- The fields a GUI edit may change (on a user model or as a cfg override).
-local EDITABLE = { 'name', 'base_url', 'model', 'api_format', 'api_key', 'proxy' }
+local EDITABLE = { 'name', 'base_url', 'model', 'api_format', 'api_key', 'proxy', 'auth_type' }
 
 -- Read models.json. Tolerant of a bare array (the oldest format).
 local function read_store()
@@ -213,7 +213,7 @@ local function write_store(store)
         clean[#clean + 1] = { id = m.id or new_id(), name = m.name, base_url = m.base_url,
             model = m.model, api_format = m.api_format, auth_style = m.auth_style,
             max_tokens_param = m.max_tokens_param, api_key = m.api_key, proxy = m.proxy,
-            prompt_cache = m.prompt_cache }
+            prompt_cache = m.prompt_cache, auth_type = m.auth_type }
     end
     local out = { models = clean }
     if next(store.overrides) then out.overrides = store.overrides end
@@ -236,6 +236,7 @@ function M.load_user_models()
             max_tokens_param = m.max_tokens_param,
             auth_style = m.auth_style or M.infer_auth_style(m.base_url, api_format),
             api_key    = m.api_key,
+            auth_type  = m.auth_type,
             proxy_own  = m.proxy,
             prompt_cache = M.parse_prompt_cache(m.prompt_cache),
             verify     = true,
@@ -250,7 +251,7 @@ local function nonblank(s)
 end
 
 -- Append a user model. m = { name?, base_url, model, api_key?, api_format?,
--- auth_style?, proxy? }.
+-- auth_style?, proxy?, auth_type? }. auth_type 'claude' = Claude account login.
 function M.add_user_model(m)
     local store = read_store()
     local api_format = resolve_api_format(m.api_format, m.base_url)
@@ -263,6 +264,7 @@ function M.add_user_model(m)
         auth_style = nonblank(m.auth_style) or M.infer_auth_style(m.base_url, api_format),
         api_key    = nonblank(m.api_key),
         proxy      = nonblank(m.proxy),
+        auth_type  = nonblank(m.auth_type),
     }
     return write_store(store)
 end
@@ -288,6 +290,7 @@ function M.update_user_model(index, e)
     if nonblank(e.model) then m.model = trim(e.model) end
     if nonblank(e.api_key) then m.api_key = trim(e.api_key) end
     if e.proxy ~= nil then m.proxy = nonblank(e.proxy) end
+    if e.auth_type ~= nil then m.auth_type = nonblank(e.auth_type) end
     -- An explicit protocol wins; a moved endpoint re-infers it; otherwise keep.
     if nonblank(e.api_format) then
         m.api_format = trim(e.api_format):lower()
@@ -309,8 +312,8 @@ function M.set_cfg_override(key, e)
     local ov = store.overrides[key] or {}
     for _, f in ipairs(EDITABLE) do
         local v = e[f]
-        if f == 'proxy' then
-            if v ~= nil then ov.proxy = trim(v) end     -- '' = inherit, kept
+        if f == 'proxy' or f == 'auth_type' then
+            if v ~= nil then ov[f] = trim(v) end        -- '' = inherit / token auth, kept
         elseif nonblank(v) then
             ov[f] = trim(v)
         end
@@ -333,6 +336,7 @@ local function apply_override(p, ov)
         if nonblank(ov[f]) then p[f] = ov[f] end
     end
     if ov.proxy ~= nil then p.proxy_own = ov.proxy end
+    if ov.auth_type ~= nil then p.auth_type = nonblank(ov.auth_type) end
     if nonblank(ov.api_format) or p.base_url ~= old_url then
         p.api_format = resolve_api_format(ov.api_format, p.base_url)
     end
@@ -393,6 +397,10 @@ function M.load_profiles()
         p.proxy = M.resolve_proxy(p.proxy_own, shared_proxy)
         if (p.base_url or ''):match('^https://chatgpt%.com/backend%-api/codex/?') then
             p.auth_type = 'chatgpt'; p.api_format = 'responses'; p.api_key = nil
+        elseif p.auth_type == 'claude' then
+            p.api_format = 'anthropic'; p.auth_style = 'bearer'; p.api_key = nil
+        else
+            p.auth_type = nil   -- only the account logins above are known
         end
     end
     return name_profiles(profiles)

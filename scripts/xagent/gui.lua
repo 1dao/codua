@@ -535,7 +535,7 @@ end
 local function submit()
     local tab = T()
     if tab.busy or not tab.sess then return end
-    if not tab.cfg or (tab.cfg.auth_type ~= 'chatgpt' and (not tab.cfg.api_key or tab.cfg.api_key == '')) then
+    if not tab.cfg or (not tab.cfg.auth_type and (not tab.cfg.api_key or tab.cfg.api_key == '')) then
         tab.status = '该模型未配置 token'; return
     end
     local text = (tab.input or ''):gsub('^%s+', ''):gsub('%s+$', '')
@@ -953,7 +953,7 @@ function new_tab(cfg, cwd)
     S.tabs[#S.tabs + 1] = tab
     S.active = #S.tabs
     S.menu, S.menu_sel, S.menu_off, S.menu_dismissed_for = nil, 1, 0, nil
-    if cfg.auth_type ~= 'chatgpt' and (not cfg.api_key or cfg.api_key == '') then
+    if not cfg.auth_type and (not cfg.api_key or cfg.api_key == '') then
         add(tab, 'error', '该模型（' .. (cfg.name or cfg.model or '?') ..
             '）未配置 token：在 xagent.local.cfg 设置 XAGENT_AUTH_TOKEN。')
     else
@@ -1352,7 +1352,7 @@ end
 
 local function open_add_model()
     S.dd_open = nil
-    S.add_model = { name = '', url = 'https://', model = '', token = '', proxy = '', api_format = nil,
+    S.add_model = { auth = 'token', name = '', url = 'https://', model = '', token = '', proxy = '', api_format = nil,
                     name_e = false, url_e = false, model_e = false, token_e = false, proxy_e = false,
                     err = nil }
 end
@@ -1366,10 +1366,12 @@ local function open_edit_model(p)
     local pinned = (p.api_format ~= inferred) and p.api_format or nil
     S.add_model = { edit = p, name = p.name_own or '', url = p.base_url or '', model = p.model or '',
                     token = '', proxy = p.proxy_own or '', api_format = pinned,
+                    auth = (p.auth_type == 'chatgpt' or p.auth_type == 'claude') and p.auth_type or 'token',
                     name_e = false, url_e = false, model_e = false, token_e = false, proxy_e = false,
                     err = nil }
     S.add_model.orig = { name = S.add_model.name, url = S.add_model.url, model = S.add_model.model,
-                         proxy = S.add_model.proxy, api_format = pinned }
+                         proxy = S.add_model.proxy, api_format = pinned,
+                         auth_type = p.auth_type == 'claude' and 'claude' or nil }
 end
 
 -- Persist the edit form: a user model is updated in place; a cfg-file profile
@@ -1386,12 +1388,15 @@ local function save_edit_model(f, url, model, proxy, token)
     if model ~= o.model then e.model = model end
     if proxy ~= o.proxy then e.proxy = proxy end
     if token ~= '' then e.api_key = token end
+    -- Only Claude needs a stored marker; ChatGPT follows its URL. '' clears it.
+    local auth_type = f.auth == 'claude' and 'claude' or nil
+    if auth_type ~= o.auth_type then e.auth_type = auth_type or '' end
     if f.api_format ~= o.api_format then e.api_format = f.api_format end
-    if next(e) == nil then return end
+    if next(e) == nil then return true end
     if p.source == 'json' then
-        config.update_user_model(p.json_index, e)
+        return config.update_user_model(p.json_index, e)
     else
-        config.set_cfg_override(p.key, e)
+        return config.set_cfg_override(p.key, e)
     end
 end
 
@@ -1401,16 +1406,17 @@ end
 -- one; auth_style is derived from the protocol (x-api-key / Bearer). 代理 is
 -- optional: empty inherits the shared XAGENT_PROXY, 'direct' opts out. Esc /
 -- 取消 closes.
-local chatgpt_login = require('xagent.auth.login')
+local oauth_login = require('xagent.auth.login')
 local chatgpt_auth = require('xagent.auth.chatgpt')
+local claude_auth = require('xagent.auth.claude')
 
 local function draw_add_model_modal(W, H)
     local f = S.add_model
     if not f then return end
     if raygui.is_key_pressed and raygui.is_key_pressed(raygui.KEY_ESCAPE) then
-        chatgpt_login.cancel(); S.add_model = nil; return
+        oauth_login.cancel(); S.add_model = nil; return
     end
-    local mw, mh = 520, 444
+    local mw, mh = 520, (f.auth == 'claude' and oauth_login.running(claude_auth)) and 552 or 480
     local mx, my = math.floor((W - mw) / 2), math.floor((H - mh) / 2)
     raygui.draw_rectangle(mx - 2, my - 2, mw + 4, mh + 4, 0, 0, 0, 170)   -- shadow/border
     local pb = S.sidebar_bg
@@ -1418,8 +1424,9 @@ local function draw_add_model_modal(W, H)
     local ac = (markdown.palette and markdown.palette.heading) or { 110, 170, 120, 255 }
     raygui.draw_rectangle(mx, my, mw, 3, ac[1], ac[2], ac[3], 255)
     raygui.label(mx + 16, my + 12, mw - 32, 24, f.edit
-        and ('编辑模型 · ' .. sanitize_label(f.edit.name or f.edit.model or '?') .. '（Token 留空=不变）')
-        or '新增模型（鉴权方式按协议自动选择）')
+        and ('编辑模型 · ' .. sanitize_label(f.edit.name or f.edit.model or '?')
+            .. (f.auth == 'token' and '（Token 留空=不变）' or ''))
+        or '新增模型')
 
     local pad, lblw = 16, 84
     local fx = mx + pad + lblw + 8
@@ -1430,48 +1437,102 @@ local function draw_add_model_modal(W, H)
         f[id], f[id .. '_e'] = raygui.textbox(fx, row, fw, rh - 4, f[id], f[id .. '_e'])
         row = row + rh + 6
     end
+
     fld('名称', 'name')
     fld('API地址', 'url')
     fld('模型ID', 'model')
-    fld('Token', 'token')
+    local function select_auth(id)
+        if f.auth ~= id then
+            oauth_login.cancel()
+            if f.auth == 'token' then
+                f.token_url, f.token_format, f.token_proxy = f.url, f.api_format, f.proxy
+            end
+            if id == 'chatgpt' then
+                f.url = chatgpt_auth.endpoint; f.api_format = 'responses'
+            elseif id == 'claude' then
+                f.url = claude_auth.endpoint; f.api_format = 'anthropic'
+            else
+                f.url = f.token_url or 'https://'; f.api_format = f.token_format
+                f.proxy = f.token_proxy or ''
+            end
+            if id ~= 'token' and (f.proxy or ''):match('^%s*$') then
+                f.proxy = 'socks5://127.0.0.1:1080'
+            end
+            f.auth, f.err = id, nil
+        end
+    end
+    local function choice(x, label, selected, action)
+        local bw = fw / 2 - 4
+        if selected then raygui.draw_rectangle(x, row + rh - 3, bw, 3, ac[1], ac[2], ac[3], 255) end
+        if raygui.button(x, row, bw, rh - 4, label) then action() end
+    end
+    raygui.label(mx + pad, row + 4, lblw, 22, '认证方式')
+    choice(fx, 'Token', f.auth == 'token', function() select_auth('token') end)
+    choice(fx + fw / 2 + 4, '授权', f.auth ~= 'token', function()
+        if f.auth == 'token' then select_auth('claude') end
+    end)
+    row = row + rh + 6
+    if f.auth ~= 'token' then
+        raygui.label(mx + pad, row + 4, lblw, 22, '授权平台')
+        choice(fx, 'Claude', f.auth == 'claude', function() select_auth('claude') end)
+        choice(fx + fw / 2 + 4, 'ChatGPT', f.auth == 'chatgpt', function() select_auth('chatgpt') end)
+        row = row + rh + 6
+    end
+    if f.auth == 'token' then fld('Token', 'token') end
     fld('代理', 'proxy')
     raygui.label(fx, row - 8, fw, 20, '空=默认  socks5://h:1080  http://u:p@h:8080')
     row = row + 16
 
-    -- Protocol toggle. Until clicked it tracks the URL (…/chat/completions,
-    -- api.openai.com → OpenAI); a click pins the choice.
-    local fmt = f.api_format or config.infer_api_format(f.url)
-    raygui.label(mx + pad, row + 4, lblw, 22, '协议')
-    local fmt_label = ({openai='OpenAI (Chat Completions)', responses='OpenAI (Responses)', anthropic='Anthropic (Messages)'})[fmt] or fmt
-    if raygui.button(fx, row, fw, rh - 4, fmt_label) then
-        f.api_format = ({anthropic='openai', openai='responses', responses='anthropic'})[fmt] or 'anthropic'
+    local auth = ({ chatgpt = chatgpt_auth, claude = claude_auth })[f.auth]
+    if not auth then
+        -- Protocol toggle. Until clicked it tracks the URL (…/chat/completions,
+        -- api.openai.com → OpenAI); a click pins the choice.
+        local fmt = f.api_format or config.infer_api_format(f.url)
+        raygui.label(mx + pad, row + 4, lblw, 22, '协议')
+        local fmt_label = ({openai='OpenAI (Chat Completions)', responses='OpenAI (Responses)', anthropic='Anthropic (Messages)'})[fmt] or fmt
+        if raygui.button(fx, row, fw, rh - 4, fmt_label) then
+            f.api_format = ({anthropic='openai', openai='responses', responses='anthropic'})[fmt] or 'anthropic'
+        end
+    else
+        local label = auth.label
+        local running = oauth_login.running(auth)
+        raygui.label(mx + pad, row + 4, lblw, 22, '账号')
+        if raygui.button(fx, row, fw / 2 - 4, rh - 4, running and ('取消 ' .. label .. ' 登录') or ('登录 ' .. label)) then
+            if running then oauth_login.cancel(); f.err = nil
+            else
+                local ok, url = pcall(oauth_login.start, {
+                    auth = auth,
+                    proxy = config.resolve_proxy(f.proxy, xutils.get_config('XAGENT_PROXY')),
+                    on_done = function(success, err)
+                        f.err = success and (label .. ' 已登录，请填写模型 ID 并保存') or err
+                    end,
+                })
+                if ok then
+                    local opened = open_url.open(url)
+                    if not opened then oauth_login.cancel(); f.err = '无法打开浏览器' else f.err = '请在浏览器完成登录' end
+                else f.err = tostring(url) end
+            end
+        end
+        if raygui.button(fx + fw / 2 + 4, row, fw / 2 - 4, rh - 4, '退出 ' .. label) then
+            if running then oauth_login.cancel() end
+            local ok, err = pcall(auth.logout)
+            f.err = ok and (label .. ' 已退出') or tostring(err)
+        end
     end
     row = row + rh + 6
 
-    if raygui.button(fx, row, fw / 2 - 4, rh - 4, chatgpt_login.running() and '取消 ChatGPT 登录' or '登录 ChatGPT') then
-        if chatgpt_login.running() then chatgpt_login.cancel(); f.err = nil
-        else
-            local ok, url = pcall(chatgpt_login.start, {
-                proxy = config.resolve_proxy(f.proxy, xutils.get_config('XAGENT_PROXY')),
-                on_done = function(success, err)
-                    if success then
-                        f.url = chatgpt_auth.endpoint; f.api_format = 'responses'; f.token = ''
-                        f.err = 'ChatGPT 已登录，请填写模型 ID 并保存'
-                    else f.err = err end
-                end,
-            })
-            if ok then
-                local opened = open_url.open(url)
-                if not opened then chatgpt_login.cancel(); f.err = '无法打开浏览器' else f.err = '请在浏览器完成登录' end
-            else f.err = tostring(url) end
+    if f.auth == 'claude' and oauth_login.running(claude_auth) then
+        f.code = f.code or ''
+        fld('授权码', 'code')
+        if raygui.button(fx, row, fw, rh - 4, '提交浏览器返回的完整授权码') and not f.exchanging then
+            f.exchanging = true
+            local ok, err = pcall(oauth_login.finish, f.code)
+            if not ok then f.err = tostring(err) end
         end
+        row = row + rh + 6
+    else
+        f.code, f.exchanging = '', false
     end
-    if raygui.button(fx + fw / 2 + 4, row, fw / 2 - 4, rh - 4, '退出 ChatGPT') then
-        chatgpt_login.cancel()
-        local ok, err = pcall(chatgpt_auth.logout)
-        f.err = ok and 'ChatGPT 已退出' or tostring(err)
-    end
-    row = row + rh + 6
 
     if f.err then
         local ec = { 220, 90, 90, 255 }
@@ -1480,33 +1541,49 @@ local function draw_add_model_modal(W, H)
     end
 
     if raygui.button(mx + mw - 16 - 96 - 8 - 96, my + mh - 44, 96, 30, '保存') then
-        local url = (f.url or ''):gsub('^%s+', ''):gsub('%s+$', '')
+        local url = (f.auth == 'chatgpt') and chatgpt_auth.endpoint
+            or (f.auth == 'claude') and claude_auth.endpoint
+            or (f.url or ''):gsub('^%s+', ''):gsub('%s+$', '')
+        local token = (f.auth == 'token') and (f.token or ''):gsub('^%s+', ''):gsub('%s+$', '') or ''
         local model = (f.model or ''):gsub('^%s+', ''):gsub('%s+$', '')
         local proxy = (f.proxy or ''):gsub('^%s+', ''):gsub('%s+$', '')
         local _, perr = xproxy.parse(proxy)
+        local account = ({ chatgpt = chatgpt_auth, claude = claude_auth })[f.auth]
+        local logged_in = false
+        if account then
+            local ok, value = pcall(account.account)
+            logged_in = ok and value ~= nil
+        end
         if url == '' or url == 'https://' or model == '' then
             f.err = '请至少填写 API地址 和 模型ID'
+        elseif account and not logged_in then
+            f.err = '请先登录 ' .. account.label
         elseif perr and proxy:lower() ~= 'direct' and proxy:lower() ~= 'none' then
             f.err = '代理格式错误: ' .. perr
         elseif f.edit then
-            save_edit_model(f, url, model, proxy, (f.token or ''):gsub('^%s+', ''):gsub('%s+$', ''))
+            local ok, err = save_edit_model(f, url, model, proxy, token)
+            if not ok then f.err = '保存失败: ' .. tostring(err or '无法写入模型配置'); return end
+            oauth_login.cancel()
             local key = f.edit.key
             reload_profiles()
             for i, p in ipairs(S.profiles) do if p.key == key then S.model_sel = i end end
             S.add_model = nil
             if T() then T().status = '已更新模型（下一轮对话生效）' end
         else
-            config.add_user_model({ name = (f.name or ''):gsub('^%s+', ''):gsub('%s+$', ''),
+            local ok, err = config.add_user_model({ name = (f.name or ''):gsub('^%s+', ''):gsub('%s+$', ''),
                 base_url = url, model = model, api_format = f.api_format,
-                api_key = (f.token or ''):gsub('^%s+', ''):gsub('%s+$', ''),
+                api_key = token,
+                auth_type = f.auth == 'claude' and 'claude' or nil,
                 proxy = proxy })
+            if not ok then f.err = '保存失败: ' .. tostring(err or '无法写入模型配置'); return end
+            oauth_login.cancel()
             reload_profiles()
             S.model_sel = #S.profiles      -- select the model just added
             S.add_model = nil
             if T() then T().status = '已添加模型' end
         end
     end
-    if raygui.button(mx + mw - 16 - 96, my + mh - 44, 96, 30, '取消') then chatgpt_login.cancel(); S.add_model = nil end
+    if raygui.button(mx + mw - 16 - 96, my + mh - 44, 96, 30, '取消') then oauth_login.cancel(); S.add_model = nil end
 end
 
 local function __init()
@@ -1607,7 +1684,7 @@ local function __init()
 end
 
 local function __update()
-    chatgpt_login.tick()
+    oauth_login.tick()
     if raygui.should_close() then xthread.stop(0); return end
     local tab = T()
     if not tab then return end
@@ -2037,7 +2114,7 @@ local function __update()
 end
 
 local function __uninit()
-    chatgpt_login.cancel()
+    oauth_login.cancel()
     -- Join the process workers while this state is still alive (see xproc.shutdown).
     subprocess.shutdown()
     if S.started then raygui.close() end

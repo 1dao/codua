@@ -14,6 +14,13 @@ local CODECS = {
 
 M.FORMATS = { 'anthropic', 'openai', 'responses' }
 
+-- Subscription accounts: cfg.auth_type names the OAuth account whose (possibly
+-- refreshed) access token replaces api_key for each request.
+local ACCOUNTS = {
+    chatgpt = 'xagent.auth.chatgpt',
+    claude = 'xagent.auth.claude',
+}
+
 function M.codec(cfg)
     local fmt = (cfg and cfg.api_format) or 'anthropic'
     local mod = CODECS[fmt]
@@ -28,14 +35,16 @@ function M.stream_message(cfg, params, cb)
         if cb and cb.on_error then cb.on_error(tostring(codec)) end
         return
     end
-    if cfg.auth_type == 'chatgpt' then
+    local account = ACCOUNTS[cfg.auth_type]
+    if account then
         local co = coroutine.create(function()
             local success, err = pcall(function()
-                local credentials = require('xagent.auth.chatgpt').ensure(cfg.proxy)
+                local credentials = require(account).ensure(cfg.proxy)
                 local request_cfg = {}; for k, v in pairs(cfg) do request_cfg[k] = v end
                 request_cfg.api_key = credentials.access_token
                 request_cfg.account_id = credentials.account_id
-                require('xagent.llm.responses').stream_message(request_cfg, params, cb)
+                request_cfg.auth_style = 'bearer'
+                codec.stream_message(request_cfg, params, cb)
             end)
             if not success and cb and cb.on_error then cb.on_error(tostring(err)) end
         end)

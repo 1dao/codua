@@ -346,6 +346,22 @@ spec.describe('proxy config', function()
         for _, p in ipairs(config.load_profiles()) do if p.key == key then return p end end
     end
 
+    spec.it('persists Claude account auth and proxy across save, edit and token switch', function()
+        with_tmp_models(function()
+            config.add_user_model({base_url='https://api.anthropic.com', model='claude-test',
+                auth_type='claude', proxy='socks5://127.0.0.1:1080'})
+            local p
+            for _, q in ipairs(config.load_profiles()) do if q.model == 'claude-test' then p=q end end
+            spec.equal(p.auth_type,'claude'); spec.nil_value(p.api_key)
+            spec.equal(p.proxy,'socks5://127.0.0.1:1080')
+            config.update_user_model(p.json_index,{name='renamed'})
+            spec.equal(find(p.key).auth_type,'claude')
+            config.update_user_model(p.json_index,{auth_type='',api_key='test-key'})
+            spec.nil_value(find(p.key).auth_type)
+            spec.equal(find(p.key).api_key,'test-key')
+        end)
+    end)
+
     spec.it('edits a user model in place and keeps its key', function()
         with_tmp_models(function()
             config.add_user_model({ base_url = 'https://api.openai.com/v1', model = 'm1', api_key = 'k1' })

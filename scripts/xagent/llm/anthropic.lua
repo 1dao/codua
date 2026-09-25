@@ -7,6 +7,7 @@
 --
 -- Config (cfg): { api_key, base_url?, model?, verify?, ca_file?, auth_style? }
 --   auth_style: 'x-api-key' (default) or 'bearer' (some compatible endpoints).
+--   auth_type: 'claude' when api_key is a Claude subscription OAuth token.
 
 local xutils = require('xutils')
 local common = require('xagent.llm.common')
@@ -16,6 +17,10 @@ local M = {}
 local DEFAULT_BASE = 'https://api.anthropic.com'
 local DEFAULT_MAX_TOKENS = 4096
 local ANTHROPIC_VERSION = '2023-06-01'
+-- Subscription OAuth tokens are only accepted with this beta, and only for
+-- requests whose system prompt opens with the Claude Code identity block.
+local OAUTH_BETA = 'oauth-2025-04-20'
+local OAUTH_IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude."
 
 -- History may hold tool_use blocks decoded by the OpenAI codec, which keeps
 -- Gemini's thought signature on them as `extra_content` (a tab can switch
@@ -119,11 +124,14 @@ function M.build_request(cfg, params)
         ['content-type'] = 'application/json',
         ['accept'] = 'text/event-stream',
     }
-    if (cfg.auth_style or 'x-api-key') == 'bearer' then
+    local oauth = cfg.auth_type == 'claude' or cfg.auth_type == 'anthropic_oauth'
+        or cfg.auth_style == 'anthropic_oauth'
+    if oauth or (cfg.auth_style or 'x-api-key') == 'bearer' then
         headers['authorization'] = 'Bearer ' .. tostring(cfg.api_key)
     else
         headers['x-api-key'] = cfg.api_key
     end
+    if oauth then headers['anthropic-beta'] = OAUTH_BETA end
 
     local cache = cfg.prompt_cache ~= false
     local messages = wire_messages(params.messages)
@@ -134,9 +142,35 @@ function M.build_request(cfg, params)
         messages = messages,
         stream = true,
     }
-    if params.system then
-        payload.system = cache and cached_system(params.system) or params.system
+    local system = params.system
+    if oauth then
+        -- Replace only the built-in identity; do not rewrite user code or history.
+        local function identity(text)
+            return (text:gsub("You are xagent, a terminal%-native local coding assistant running inside the user's workspace%.", ''))
+        end
+        if type(system) == 'string' then system = identity(system)
+        elseif type(system) == 'table' then
+            local copy = {}
+            for i, block in ipairs(system) do
+                local b = {}; for k, v in pairs(block) do b[k] = v end
+                if b.type == 'text' and type(b.text) == 'string' then b.text = identity(b.text) end
+                copy[i] = b
+            end
+            system = copy
+        end
     end
+    if system and cache then system = cached_system(system) end
+    if oauth then
+        -- A separate leading block keeps the caller's (cached) system intact.
+        local blocks = { { type = 'text', text = OAUTH_IDENTITY } }
+        if type(system) == 'string' and system ~= '' then
+            blocks[2] = { type = 'text', text = system }
+        elseif type(system) == 'table' then
+            for _, b in ipairs(system) do blocks[#blocks + 1] = b end
+        end
+        system = blocks
+    end
+    if system then payload.system = system end
     if params.tools and #params.tools > 0 then payload.tools = params.tools end
     if params.tool_choice then payload.tool_choice = params.tool_choice end
 
@@ -163,6 +197,7 @@ function M.new_decoder(cb)
     local self = {
         blocks = {},          -- index(0-based) -> content block
         tool_json = {},       -- index -> accumulated input_json string
+        open_blocks = {},
         max_index = -1,
         usage = { input_tokens = 0, output_tokens = 0 },
         stop_reason = '',
@@ -200,14 +235,23 @@ function M.new_decoder(cb)
 
         elseif t == 'content_block_start' then
             local i = ev.index
+            if type(i) ~= 'number' or i < 0 or i % 1 ~= 0 then
+                self.errored = true
+                if cb.on_error then cb.on_error('invalid content block index') end
+                return
+            end
             note_index(i)
+            self.open_blocks[i] = true
             local b = ev.content_block or {}
             if b.type == 'text' then
-                self.blocks[i] = { type = 'text', text = '' }
+                self.blocks[i] = { type = 'text', text = b.text or '' }
+                if b.text and b.text ~= '' and cb.on_text then cb.on_text(b.text) end
             elseif b.type == 'thinking' then
-                self.blocks[i] = { type = 'thinking', thinking = b.thinking or '' }
+                self.blocks[i] = { type = 'thinking', thinking = b.thinking or '', signature = b.signature }
+            elseif b.type == 'redacted_thinking' then
+                self.blocks[i] = { type = 'redacted_thinking', data = b.data }
             elseif b.type == 'tool_use' then
-                self.blocks[i] = { type = 'tool_use', id = b.id, name = b.name, input = {} }
+                self.blocks[i] = { type = 'tool_use', id = b.id, name = b.name, input = b.input or {} }
                 self.tool_json[i] = ''
                 if cb.on_tool_use_start then cb.on_tool_use_start(b.id, b.name) end
             end
@@ -233,8 +277,10 @@ function M.new_decoder(cb)
 
         elseif t == 'content_block_stop' then
             local i = ev.index
+            if i == nil then return end
+            self.open_blocks[i] = nil
             local b = self.blocks[i]
-            if b and b.type == 'tool_use' then
+            if b and b.type == 'tool_use' and self.tool_json[i] ~= '' then
                 b.input = common.parse_tool_input(self.tool_json[i], b.name)
             end
 
@@ -290,6 +336,11 @@ function M.new_decoder(cb)
             return
         end
         local content = {}
+        if next(self.open_blocks) then
+            self.errored = true
+            if cb.on_error then cb.on_error('stream ended before content blocks completed') end
+            return
+        end
         for i = 0, self.max_index do
             if self.blocks[i] then content[#content + 1] = self.blocks[i] end
         end
