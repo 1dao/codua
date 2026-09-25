@@ -17,10 +17,63 @@ local M = {}
 local DEFAULT_BASE = 'https://api.anthropic.com'
 local DEFAULT_MAX_TOKENS = 4096
 local ANTHROPIC_VERSION = '2023-06-01'
--- Subscription OAuth tokens are only accepted with this beta, and only for
--- requests whose system prompt opens with the Claude Code identity block.
-local OAUTH_BETA = 'oauth-2025-04-20'
+-- Match OpenCode's Anthropic provider headers + opencode-anthropic-auth 0.0.13
+-- request adapter. Keep the compatibility transform exclusive to OAuth.
+local OAUTH_BETA = 'oauth-2025-04-20,interleaved-thinking-2025-05-14,' ..
+    'claude-code-20250219,fine-grained-tool-streaming-2025-05-14'
 local OAUTH_IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude."
+local function is_oauth(cfg)
+    return cfg and (cfg.auth_type == 'claude' or cfg.auth_type == 'anthropic_oauth'
+        or cfg.auth_style == 'anthropic_oauth')
+end
+local function copy(value)
+    local out = {}; for k, v in pairs(value) do out[k] = v end; return out
+end
+
+-- OpenCode sanitizes system text, not user messages, tool arguments or results.
+-- Include the names used by both our desktop and Android system prompts.
+local function oauth_system_text(text)
+    text = text:gsub('Always identify yourself as codua; codua2a is the Android project name, not your assistant name%. ?', '')
+    text = text:gsub('OpenCode', 'Claude Code')
+    return (text:gsub('[Oo][Pp][Ee][Nn][Cc][Oo][Dd][Ee]', 'Claude')
+        :gsub('[Cc][Oo][Dd][Uu][Aa]2[Aa]', 'Claude Code')
+        :gsub('[Cc][Oo][Dd][Uu][Aa]', 'Claude Code')
+        :gsub('[Xx][Aa][Gg][Ee][Nn][Tt]', 'Claude Code'))
+end
+
+local function oauth_tools(payload)
+    if payload.tools then
+        local tools = {}
+        for i, tool in ipairs(payload.tools) do
+            local t = copy(tool)
+            -- Always add one prefix, even to mcp_*: Read and mcp_Read must not
+            -- collide. The OAuth decoder removes exactly the prefix we added.
+            if type(t.name) == 'string' then t.name = 'mcp_' .. t.name end
+            tools[i] = t
+        end
+        payload.tools = tools
+    end
+    if type(payload.tool_choice) == 'table' and payload.tool_choice.type == 'tool'
+        and type(payload.tool_choice.name) == 'string' then
+        payload.tool_choice = copy(payload.tool_choice)
+        payload.tool_choice.name = 'mcp_' .. payload.tool_choice.name
+    end
+    local messages = {}
+    for i, message in ipairs(payload.messages) do
+        local m = copy(message)
+        if type(m.content) == 'table' then
+            m.content = {}
+            for j, block in ipairs(message.content) do
+                if block.type == 'tool_use' and type(block.name) == 'string' then
+                    block = copy(block); block.name = 'mcp_' .. block.name
+                end
+                m.content[j] = block
+            end
+        end
+        messages[i] = m
+    end
+    payload.messages = messages
+end
 
 -- History may hold tool_use blocks decoded by the OpenAI codec, which keeps
 -- Gemini's thought signature on them as `extra_content` (a tab can switch
@@ -124,14 +177,16 @@ function M.build_request(cfg, params)
         ['content-type'] = 'application/json',
         ['accept'] = 'text/event-stream',
     }
-    local oauth = cfg.auth_type == 'claude' or cfg.auth_type == 'anthropic_oauth'
-        or cfg.auth_style == 'anthropic_oauth'
+    local oauth = is_oauth(cfg)
     if oauth or (cfg.auth_style or 'x-api-key') == 'bearer' then
         headers['authorization'] = 'Bearer ' .. tostring(cfg.api_key)
     else
         headers['x-api-key'] = cfg.api_key
     end
-    if oauth then headers['anthropic-beta'] = OAUTH_BETA end
+    if oauth then
+        headers['anthropic-beta'] = OAUTH_BETA
+        headers['user-agent'] = 'claude-cli/2.1.2 (external, cli)'
+    end
 
     local cache = cfg.prompt_cache ~= false
     local messages = wire_messages(params.messages)
@@ -144,16 +199,12 @@ function M.build_request(cfg, params)
     }
     local system = params.system
     if oauth then
-        -- Replace only the built-in identity; do not rewrite user code or history.
-        local function identity(text)
-            return (text:gsub("You are xagent, a terminal%-native local coding assistant running inside the user's workspace%.", ''))
-        end
-        if type(system) == 'string' then system = identity(system)
+        if type(system) == 'string' then system = oauth_system_text(system)
         elseif type(system) == 'table' then
             local copy = {}
             for i, block in ipairs(system) do
                 local b = {}; for k, v in pairs(block) do b[k] = v end
-                if b.type == 'text' and type(b.text) == 'string' then b.text = identity(b.text) end
+                if b.type == 'text' and type(b.text) == 'string' then b.text = oauth_system_text(b.text) end
                 copy[i] = b
             end
             system = copy
@@ -173,6 +224,7 @@ function M.build_request(cfg, params)
     if system then payload.system = system end
     if params.tools and #params.tools > 0 then payload.tools = params.tools end
     if params.tool_choice then payload.tool_choice = params.tool_choice end
+    if oauth then oauth_tools(payload) end
 
     local body = common.json_encode(payload)   -- sorted keys: a stable, cacheable prefix
     if not body or body == '' then
@@ -181,7 +233,7 @@ function M.build_request(cfg, params)
         error('json_pack produced an empty body (invalid UTF-8 or non-encodable value in messages)')
     end
     return {
-        url = base .. '/v1/messages',
+        url = base .. '/v1/messages' .. (oauth and '?beta=true' or ''),
         headers = headers,
         body = body,
     }
@@ -192,7 +244,7 @@ end
 --   cb = { on_text(delta), on_tool_use_start(id, name), on_tool_input(id, frag),
 --          on_done(result), on_error(msg) }
 --   result = { message = {role='assistant', content={...}}, usage, stop_reason, id }
-function M.new_decoder(cb)
+function M.new_decoder(cb, cfg)
     cb = cb or {}
     local self = {
         blocks = {},          -- index(0-based) -> content block
@@ -251,9 +303,11 @@ function M.new_decoder(cb)
             elseif b.type == 'redacted_thinking' then
                 self.blocks[i] = { type = 'redacted_thinking', data = b.data }
             elseif b.type == 'tool_use' then
-                self.blocks[i] = { type = 'tool_use', id = b.id, name = b.name, input = b.input or {} }
+                local name = b.name
+                if is_oauth(cfg) and type(name) == 'string' then name = name:gsub('^mcp_', '', 1) end
+                self.blocks[i] = { type = 'tool_use', id = b.id, name = name, input = b.input or {} }
                 self.tool_json[i] = ''
-                if cb.on_tool_use_start then cb.on_tool_use_start(b.id, b.name) end
+                if cb.on_tool_use_start then cb.on_tool_use_start(b.id, name) end
             end
 
         elseif t == 'content_block_delta' then

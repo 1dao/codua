@@ -9,7 +9,7 @@ local codec = require('xagent.llm.anthropic')
 local function event(d, value) d:on_sse(value.type, json.json_pack(value)) end
 
 spec.describe('Anthropic review regressions', function()
-    spec.it('preserves OAuth user content, tool names, choice and history', function()
+    spec.it('maps OAuth tools and choice without changing user content or stored history', function()
         for _, mode in ipairs({'claude', 'anthropic_oauth'}) do
             local history = {{role='user', content={{type='text', text='codua2a OpenCode opencode'}}}}
             local tools = {{name='mcp_Read', description='Read codua', input_schema={type='object'}}}
@@ -20,10 +20,56 @@ spec.describe('Anthropic review regressions', function()
             spec.nil_value(req.headers['x-api-key'])
             spec.contains(body.system[1].text, 'Claude Code')
             spec.equal(body.messages[1].content[1].text, history[1].content[1].text)
-            spec.equal(body.tools[1].name, 'mcp_Read')
+            spec.equal(body.tools[1].name, 'mcp_mcp_Read')
+            spec.equal(tools[1].name, 'mcp_Read')
             spec.equal(body.tools[1].description, 'Read codua')
             spec.equal(body.tool_choice.name, body.tools[1].name)
             spec.nil_value(history[1].content[1].cache_control)
+        end
+    end)
+    spec.it('matches OpenCode OAuth headers and sanitizes every system block', function()
+        local system = {{type='text',text='You are codua. Always identify yourself as codua; codua2a is the Android project name, not your assistant name.'},
+            {type='text',text='You are xagent. OpenCode opencode OPENCODE Codua CODUA2A'}}
+        for _, cache in ipairs({true,false}) do
+            local req=codec.build_request({api_key='test',auth_type='anthropic_oauth',prompt_cache=cache}, {system=system,messages={}})
+            spec.equal(req.url,'https://api.anthropic.com/v1/messages?beta=true')
+            spec.equal(req.headers['user-agent'],'claude-cli/2.1.2 (external, cli)')
+            spec.equal(req.headers['anthropic-beta'],'oauth-2025-04-20,interleaved-thinking-2025-05-14,claude-code-20250219,fine-grained-tool-streaming-2025-05-14')
+            local body=json.json_unpack(req.body)
+            spec.equal(body.system[1].text,"You are Claude Code, Anthropic's official CLI for Claude.")
+            for _, b in ipairs(body.system) do
+                for _, name in ipairs({'codua','xagent','opencode'}) do spec.nil_value(b.text:lower():find(name,1,true)) end
+            end
+            spec.contains(system[1].text,'You are codua')
+        end
+    end)
+    spec.it('roundtrips colliding prefixed names through tools, callbacks and continuation history',function()
+        local result, starts
+        starts={}
+        local cfg={api_key='test',auth_type='claude'}
+        local d=codec.new_decoder({on_done=function(v) result=v end,
+            on_tool_use_start=function(_,name) starts[#starts+1]=name end},cfg)
+        local tools={{name='Read'},{name='mcp_Read'}}
+        for i,t in ipairs(tools) do
+            event(d,{type='content_block_start',index=i-1,content_block={type='tool_use',id='t'..i,name='mcp_'..t.name}})
+            event(d,{type='content_block_stop',index=i-1})
+        end
+        event(d,{type='message_stop'})
+        local body=json.json_unpack(codec.build_request(cfg,{tools=tools,messages={result.message}}).body)
+        for i,t in ipairs(tools) do
+            spec.equal(starts[i],t.name);spec.equal(result.message.content[i].name,t.name)
+            spec.equal(body.tools[i].name,'mcp_'..t.name)
+            spec.equal(body.messages[1].content[i].name,body.tools[i].name)
+        end
+    end)
+    spec.it('leaves API-key and ordinary Bearer requests untouched',function()
+        for _, style in ipairs({'x-api-key','bearer'}) do
+            local req=codec.build_request({api_key='test',auth_style=style,prompt_cache=false},
+                {system='You are codua xagent OpenCode',messages={},tools={{name='mcp_Read'}}})
+            local body=json.json_unpack(req.body)
+            spec.equal(req.url,'https://api.anthropic.com/v1/messages')
+            spec.nil_value(req.headers['user-agent']);spec.nil_value(req.headers['anthropic-beta'])
+            spec.equal(body.system,'You are codua xagent OpenCode');spec.equal(body.tools[1].name,'mcp_Read')
         end
     end)
     spec.it('preserves initial text, signed and redacted thinking, and real mcp tool names', function()

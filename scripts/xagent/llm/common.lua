@@ -175,7 +175,7 @@ function M.stream_message(codec, cfg, params, cb)
             -- decoder errors include the "connection closed before any data"
             -- case (got_any=false) and in-stream error events — both transient.
             on_error = function(m) retry_or_fail(m, true) end,
-        })
+        }, cfg)
 
         stream.request({
             url = req.url, method = 'POST', headers = req.headers, body = req.body,

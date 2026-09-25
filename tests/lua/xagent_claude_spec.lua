@@ -57,7 +57,7 @@ spec.describe('Claude OAuth Messages request',function()
         local req=anthropic.build_request({api_key='tok',auth_type='claude',auth_style='bearer'},
             {messages={{role='user',content='hi'}},system='SYS'})
         spec.equal(req.headers['authorization'],'Bearer tok');spec.nil_value(req.headers['x-api-key'])
-        spec.equal(req.headers['anthropic-beta'],'oauth-2025-04-20')
+        spec.equal(req.headers['anthropic-beta'],'oauth-2025-04-20,interleaved-thinking-2025-05-14,claude-code-20250219,fine-grained-tool-streaming-2025-05-14')
         local body=json.json_unpack(req.body)
         spec.contains(body.system[1].text,'Claude Code');spec.equal(body.system[2].text,'SYS')
         spec.truthy(body.system[2].cache_control)
