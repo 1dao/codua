@@ -6,15 +6,15 @@
 -- inside the agent coroutine — they await the transport.
 --
 -- Transports: `http` and `sse` configs use the Streamable HTTP transport
--- (transport_http). `stdio` is recognized but unsupported on this runtime — it
--- needs a long-lived bidirectional child-process pipe, which xnet2lua has no
--- binding for yet (the one-shot io.popen worker can't keep stdin+stdout open).
--- Such a server is marked `unsupported` with an actionable message instead of
--- crashing the bootstrap.
+-- (transport_http); `stdio` spawns the server as a child process and speaks
+-- line-delimited JSON-RPC over its stdin/stdout (transport_stdio, native xproc).
+-- A runtime without xproc marks a stdio server `unsupported` with an actionable
+-- message instead of crashing the bootstrap. close() stops a stdio server.
 --
 -- Reference: ../easy-agent/src/services/mcp/client.ts + fetchTools.ts.
 
 local http = require('xagent.mcp.transport_http')
+local stdio = require('xagent.mcp.transport_stdio')
 
 local M = {}
 
@@ -45,28 +45,43 @@ function Client:connect()
     local cfg = self.config
 
     if cfg.type == 'stdio' then
-        self.status = 'unsupported'
-        self.error = 'stdio transport is not available on this runtime ' ..
-            '(needs a bidirectional child-process pipe); use an http/sse MCP server'
-        return false, self.error
+        local ok, why = stdio.available()
+        if not ok then
+            self.status = 'unsupported'
+            self.error = 'stdio transport unavailable: ' .. why
+            return false, self.error
+        end
+        self.io = stdio
+        self.transport = {
+            command = cfg.command, args = cfg.args, env = cfg.env, cwd = cfg.cwd,
+            timeout_ms = cfg.timeout_ms,
+        }
+        local opened, oerr = stdio.open(self.transport)
+        if not opened then
+            self.status = 'failed'
+            self.error = oerr
+            return false, oerr
+        end
+    else
+        self.io = http
+        self.transport = {
+            url = cfg.url,
+            headers = cfg.headers,
+            verify = cfg.verify,
+            ca_file = cfg.ca_file,
+            timeout_ms = cfg.timeout_ms,
+            session_id = nil,
+            protocol_version = nil,
+        }
     end
 
-    self.transport = {
-        url = cfg.url,
-        headers = cfg.headers,
-        verify = cfg.verify,
-        ca_file = cfg.ca_file,
-        timeout_ms = cfg.timeout_ms,
-        session_id = nil,
-        protocol_version = nil,
-    }
-
-    local result, err = http.rpc(self.transport, 'initialize', {
+    local result, err = self.io.rpc(self.transport, 'initialize', {
         protocolVersion = CLIENT_PROTOCOL_VERSION,
         capabilities = {},               -- we expose no client capabilities yet
         clientInfo = CLIENT_INFO,
     })
     if not result then
+        self:close()
         self.status = 'failed'
         self.error = err
         return false, err
@@ -78,7 +93,7 @@ function Client:connect()
 
     -- Tell the server we're ready. Best-effort: a notify failure here doesn't
     -- invalidate an otherwise-good session (some servers don't require it).
-    http.notify(self.transport, 'notifications/initialized', nil)
+    self.io.notify(self.transport, 'notifications/initialized', nil)
 
     self.status = 'connected'
     return true
@@ -87,7 +102,15 @@ end
 -- Raw request passthrough (used by the resource tools). Returns (result, err).
 function Client:request(method, params)
     if self.status ~= 'connected' then return nil, 'MCP server "' .. self.name .. '" not connected' end
-    return http.rpc(self.transport, method, params)
+    return self.io.rpc(self.transport, method, params)
+end
+
+-- Release the connection. A stdio server is asked to exit (stdin EOF) and is
+-- killed if it lingers; `now` kills it at once (process shutdown). HTTP holds
+-- no resources between requests. Safe to call more than once.
+function Client:close(now)
+    if self.io and self.io.close and self.transport then self.io.close(self.transport, now) end
+    if self.status == 'connected' then self.status = 'closed' end
 end
 
 -- tools/list. Returns ({tool, ...}, nil), or ({}, nil) if no tools capability,

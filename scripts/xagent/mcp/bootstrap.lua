@@ -34,6 +34,7 @@ function M.bootstrap(cwd, opts)
 
     for _, entry in ipairs(mcp_registry.all()) do
         for _, t in ipairs(entry.tools) do tool_registry.unregister(t.name) end
+        if entry.connection and entry.connection.close then entry.connection:close() end
     end
     mcp_registry.clear()
     local summary = {
@@ -50,6 +51,8 @@ function M.bootstrap(cwd, opts)
     for _, name in ipairs(names_list) do
         local cfg = servers[name]
         if opts.verify ~= nil and cfg.verify == nil then cfg.verify = opts.verify end
+        -- A stdio server starts in the project directory, as other MCP hosts do.
+        if cfg.type == 'stdio' and cfg.cwd == nil and cwd and cwd ~= '' then cfg.cwd = cwd end
 
         local c = client.new(name, cfg)
         local ok = c:connect()
@@ -90,5 +93,12 @@ function M.bootstrap(cwd, opts)
     return summary
 end
 
+-- Stop every stdio server right away (the process is exiting and timers will
+-- not fire again). Idempotent.
+function M.shutdown()
+    for _, entry in ipairs(mcp_registry.all()) do
+        if entry.connection and entry.connection.close then entry.connection:close(true) end
+    end
+end
 
 return M

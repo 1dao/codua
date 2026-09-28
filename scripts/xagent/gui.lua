@@ -488,13 +488,15 @@ local function mcp_status_text()
     end
     for _, c in ipairs(conns) do
         local entry = mcp_registry.get(c.name)
-        local line = string.format('%s %s  [%s]  %d 工具%s', mcp_status_icon(c), c.name, c.status,
-            entry and #entry.tools or 0, (c.config and c.config.scope == 'project') and '  · 项目配置' or '')
+        local line = string.format('%s %s  [%s]  %s  %d 工具%s', mcp_status_icon(c), c.name, c.status,
+            c.config and c.config.type or '?', entry and #entry.tools or 0,
+            (c.config and c.config.scope == 'project') and '  · 项目配置' or '')
         if c.error then line = line .. '  — ' .. tostring(c.error) end
         lines[#lines + 1] = line
     end
     lines[#lines + 1] = ''
-    lines[#lines + 1] = '/mcp add <名称> <url> [--sse] [-H "Key: Value"]...  添加或更新'
+    lines[#lines + 1] = '/mcp add <名称> <url> [--sse] [-H "Key: Value"]...  添加或更新 HTTP/SSE'
+    lines[#lines + 1] = '/mcp add <名称> [-e KEY=VALUE]... -- <命令> [参数...]  添加或更新 stdio'
     lines[#lines + 1] = '/mcp remove <名称>  删除   /mcp reload  重新连接'
     lines[#lines + 1] = '也可在设置（齿轮）→ MCP 服务器 中管理'
     return table.concat(lines, '\n')
@@ -528,45 +530,78 @@ local function mcp_shadow_note(name)
     end
 end
 
--- /mcp add <name> <url> [--sse] [-H "Key: Value"]... — add or replace a user
--- server, keeping any fields of an existing entry this command does not set
--- (headers included, unless -H is given).
+local MCP_ADD_USAGE = '用法: /mcp add <名称> <url> [--sse] [-H "Key: Value"]...\n'
+    .. '　　　/mcp add <名称> [-e KEY=VALUE]... -- <命令> [参数...]'
+
+-- /mcp add <name> <url> [--sse] [-H "Key: Value"]...          (HTTP / SSE)
+-- /mcp add <name> [-e KEY=VALUE]... -- <command> [args...]    (stdio)
+-- Adds or replaces a user server, keeping fields of an existing entry of the
+-- same kind that the command does not set: headers without -H, env without -e.
 local function mcp_add_command(args)
-    local name, url = args[2], args[3]
-    if not name or not url then return nil, '用法: /mcp add <名称> <url> [--sse] [-H "Key: Value"]...' end
-    local ok = mcp_config.check_name(name)
-    if not ok then return nil, '名称只能包含字母、数字、_ 和 -（最长 64）' end
-    if not url:match('^https?://.+') then return nil, 'url 需以 http:// 或 https:// 开头' end
-    local kind, headers = 'http', nil
-    local i = 4
+    local name = args[2]
+    if not name then return nil, MCP_ADD_USAGE end
+    if not mcp_config.check_name(name) then return nil, '名称只能包含字母、数字、_ 和 -（最长 64）' end
+    local kind, url, headers, env, command, cargs = 'http', nil, nil, nil, nil, nil
+    local i = 3
     while args[i] do
         local a = args[i]
-        if a == '--sse' then
+        if a == '--' then
+            command = args[i + 1]
+            if not command or command == '' then return nil, '-- 后需要跟要运行的命令' end
+            cargs = {}
+            for j = i + 2, #args do cargs[#cargs + 1] = args[j] end
+            kind = 'stdio'
+            break
+        elseif a == '--sse' then
             kind = 'sse'
         elseif a == '-H' or a == '--header' then
-            local h = args[i + 1]
-            local k, v = (h or ''):match('^%s*([^:]-)%s*:%s*(.-)%s*$')
+            local k, v = (args[i + 1] or ''):match('^%s*([^:]-)%s*:%s*(.-)%s*$')
             if not k or k == '' or v == '' then return nil, '请求头格式应为 "Key: Value"' end
             headers = headers or {}
             headers[k] = v
             i = i + 1
+        elseif a == '-e' or a == '--env' then
+            local k, v = (args[i + 1] or ''):match('^([^=]+)=(.*)$')
+            if not k then return nil, '环境变量格式应为 KEY=VALUE' end
+            env = env or {}
+            env[k] = v
+            i = i + 1
+        elseif not url and not a:match('^%-') then
+            url = a
         else
-            return nil, '未知参数: ' .. a
+            return nil, '未知参数: ' .. a .. '\n' .. MCP_ADD_USAGE
         end
         i = i + 1
     end
+    if kind == 'stdio' then
+        if url then return nil, 'stdio 服务器不需要 url；命令写在 -- 之后' end
+        if headers then return nil, '-H 只用于 HTTP/SSE 服务器' end
+    else
+        if not url then return nil, MCP_ADD_USAGE end
+        if not url:match('^https?://.+') then return nil, 'url 需以 http:// 或 https:// 开头' end
+        if env then return nil, '-e 只用于 stdio 服务器（命令写在 -- 之后）' end
+    end
+
     local doc, servers = mcp_config.read_user()
     if not doc then return nil, servers end
+    local old = type(servers[name]) == 'table' and servers[name] or nil
+    local old_stdio = old and (old.type == 'stdio' or (old.type == nil and old.url == nil))
     local raw = {}
-    if type(servers[name]) == 'table' then
-        for k, v in pairs(servers[name]) do raw[k] = v end
+    for k, v in pairs(old or {}) do raw[k] = v end
+    raw.type = kind
+    if kind == 'stdio' then
+        raw.url, raw.headers = nil, nil
+        raw.command = command
+        raw.args = #cargs > 0 and cargs or nil
+        if env then raw.env = env elseif not old_stdio then raw.env = nil end
+    else
+        raw.command, raw.args, raw.env = nil, nil, nil
+        raw.url = url
+        if headers then raw.headers = headers elseif old_stdio then raw.headers = nil end
     end
-    raw.type, raw.url = kind, url
-    if headers then raw.headers = headers end     -- no -H keeps the existing headers
-    raw.command, raw.args, raw.env = nil, nil, nil
     local saved, err = mcp_config.save_user_server(name, raw)
     if not saved then return nil, err end
-    return servers[name] ~= nil and 'updated' or 'added'
+    return old and 'updated' or 'added'
 end
 
 local function handle_slash(text)
@@ -1734,65 +1769,112 @@ local function draw_add_model_modal(W, H)
 end
 
 -- ── MCP server form (settings → MCP 服务器) ─────────────────────────────────
--- Edits one entry of the user file. Existing header values are never shown:
--- a blank value keeps the stored one (like the model form's Token), and
--- clearing a header's key removes it.
-local MCP_MAX_HEADERS = 6
+-- Edits one entry of the user file: an HTTP/SSE server (url + headers) or a
+-- stdio server (command + args + env). Existing header and env values are never
+-- shown: a blank value keeps the stored one (like the model form's Token), and
+-- clearing a key removes it.
+local MCP_MAX_PAIRS = 6
 
 local function trim(s) return ((s or ''):gsub('^%s+', ''):gsub('%s+$', '')) end
 
+-- Inverse of split_args: quote what would not survive a whitespace split.
+local function join_args(list)
+    local out = {}
+    for _, a in ipairs(list or {}) do
+        a = tostring(a)
+        if a == '' or a:find('[%s"\']') then
+            a = a:find('"', 1, true) and ("'" .. a .. "'") or ('"' .. a .. '"')
+        end
+        out[#out + 1] = a
+    end
+    return table.concat(out, ' ')
+end
+
+-- Key/value rows for a stored map (values hidden), plus one empty row.
+local function pair_rows(map)
+    local rows, keys = {}, {}
+    if type(map) == 'table' then for k in pairs(map) do keys[#keys + 1] = k end end
+    table.sort(keys)
+    for _, k in ipairs(keys) do rows[#rows + 1] = { key = k, val = '', orig = k } end
+    if #rows < MCP_MAX_PAIRS then rows[#rows + 1] = { key = '', val = '' } end
+    return rows
+end
+
+local function is_stdio_entry(raw)
+    return raw.type == 'stdio' or (raw.type == nil and raw.url == nil and raw.command ~= nil)
+end
+
 local function open_mcp_form(name)
     S.dd_open = nil
-    local f = { name = '', url = 'http://', type = 'http', headers = {}, err = nil }
+    local f = { name = '', url = 'http://', type = 'http', command = '', args = '', err = nil }
+    local raw = {}
     if name then
         local doc, servers = mcp_config.read_user()
         if not doc then add(T(), 'error', 'MCP: ' .. tostring(servers)); return end
-        local raw = servers[name]
+        raw = servers[name]
         if type(raw) ~= 'table' then
             add(T(), 'system', name .. ' 来自当前目录的 .mcp.json（项目配置），请直接编辑该文件')
             return
         end
         f.edit, f.raw, f.name = name, raw, name
-        f.url = type(raw.url) == 'string' and raw.url or ''
-        f.type = raw.type == 'sse' and 'sse' or 'http'
-        if raw.command ~= nil or (raw.type ~= nil and raw.type ~= 'http' and raw.type ~= 'sse') then
-            f.unsupported = true      -- stdio: codua cannot connect it; offer delete only
-        end
-        local keys = {}
-        if type(raw.headers) == 'table' then
-            for k in pairs(raw.headers) do keys[#keys + 1] = k end
-        end
-        table.sort(keys)
-        for _, k in ipairs(keys) do
-            f.headers[#f.headers + 1] = { key = k, val = '', orig = k }
+        if is_stdio_entry(raw) then
+            f.type = 'stdio'
+            f.command = type(raw.command) == 'string' and raw.command or ''
+            f.args = type(raw.args) == 'table' and join_args(raw.args) or ''
+        else
+            f.type = raw.type == 'sse' and 'sse' or 'http'
+            f.url = type(raw.url) == 'string' and raw.url or ''
         end
     end
-    if #f.headers < MCP_MAX_HEADERS then f.headers[#f.headers + 1] = { key = '', val = '' } end
+    f.headers = pair_rows(raw.headers)
+    f.envs = pair_rows(raw.env)
     S.mcp_form = f
 end
 
-local function save_mcp_form(f)
-    local name, url = trim(f.name), trim(f.url)
-    if not mcp_config.check_name(name) then return nil, '名称只能包含字母、数字、_ 和 -（最长 64）' end
-    if not url:match('^https?://.+') then return nil, '地址需以 http:// 或 https:// 开头' end
-    local old = f.raw and type(f.raw.headers) == 'table' and f.raw.headers or {}
-    local headers, seen = {}, {}
-    for _, h in ipairs(f.headers) do
-        local k, v = trim(h.key), trim(h.val)
+-- Collect key/value rows into a map; blank values keep the stored ones.
+local function collect_pairs(rows, old, what, bad_key)
+    local map, seen = {}, {}
+    for _, r in ipairs(rows) do
+        local k, v = trim(r.key), trim(r.val)
         if k ~= '' then
-            if k:find('[%s:]') then return nil, '请求头名称不能包含空格或冒号: ' .. k end
-            if seen[k:lower()] then return nil, '请求头重复: ' .. k end
+            if k:find(bad_key) then return nil, what .. '名称不能包含空格、冒号或等号: ' .. k end
+            if seen[k:lower()] then return nil, what .. '重复: ' .. k end
             seen[k:lower()] = true
-            if v == '' and h.orig then v = old[h.orig] end
-            if type(v) ~= 'string' or v == '' then return nil, '请求头 ' .. k .. ' 缺少值' end
-            headers[k] = v
+            if v == '' and r.orig then v = type(old) == 'table' and old[r.orig] or nil end
+            if type(v) ~= 'string' or v == '' then return nil, what .. ' ' .. k .. ' 缺少值' end
+            map[k] = v
         end
     end
+    return map
+end
+
+local function save_mcp_form(f)
+    local name = trim(f.name)
+    if not mcp_config.check_name(name) then return nil, '名称只能包含字母、数字、_ 和 -（最长 64）' end
     local raw = {}
     for k, v in pairs(f.raw or {}) do raw[k] = v end
-    raw.type, raw.url = f.type, url
-    raw.headers = next(headers) and headers or nil
-    raw.command, raw.args, raw.env = nil, nil, nil
+    local old = f.raw or {}
+    raw.type = f.type
+    if f.type == 'stdio' then
+        local command = trim(f.command)
+        if command == '' then return nil, '请填写要运行的命令' end
+        local args, aerr = split_args(f.args or '')
+        if not args then return nil, '参数: ' .. aerr end
+        local env, eerr = collect_pairs(f.envs, is_stdio_entry(old) and old.env, '环境变量', '[%s=]')
+        if not env then return nil, eerr end
+        raw.url, raw.headers = nil, nil
+        raw.command = command
+        raw.args = #args > 0 and args or nil
+        raw.env = next(env) and env or nil
+    else
+        local url = trim(f.url)
+        if not url:match('^https?://.+') then return nil, '地址需以 http:// 或 https:// 开头' end
+        local headers, herr = collect_pairs(f.headers, not is_stdio_entry(old) and old.headers, '请求头', '[%s:]')
+        if not headers then return nil, herr end
+        raw.command, raw.args, raw.env = nil, nil, nil
+        raw.url = url
+        raw.headers = next(headers) and headers or nil
+    end
     local ok, err = mcp_config.save_user_server(name, raw, f.edit)
     if not ok then
         if tostring(err):find('already exists', 1, true) then return nil, '已存在同名服务器: ' .. name end
@@ -1801,14 +1883,18 @@ local function save_mcp_form(f)
     return name
 end
 
+local MCP_TYPES = { { 'http', 'HTTP' }, { 'sse', 'SSE' }, { 'stdio', 'stdio' } }
+
 local function draw_mcp_modal(W, H)
     local f = S.mcp_form
     if not f then return end
     if raygui.is_key_pressed and raygui.is_key_pressed(raygui.KEY_ESCAPE) then S.mcp_form = nil; return end
+    local stdio = f.type == 'stdio'
+    local rows = stdio and f.envs or f.headers
     local pad, lblw, rh = 16, 84, 30
-    local nh = f.unsupported and 0 or #f.headers
-    local mw = 540
-    local mh = f.unsupported and 190 or (48 + 3 * (rh + 6) + 26 + nh * (rh + 6) + 36 + 30 + 56)
+    local mw = 560
+    local fixed = stdio and 4 or 3          -- 名称 类型 + 地址 | 命令 参数
+    local mh = 48 + fixed * (rh + 6) + 26 + #rows * (rh + 6) + 36 + 30 + 56
     local mx, my = math.floor((W - mw) / 2), math.floor((H - mh) / 2)
     raygui.draw_rectangle(mx - 2, my - 2, mw + 4, mh + 4, 0, 0, 0, 170)
     local pb = S.sidebar_bg
@@ -1821,44 +1907,45 @@ local function draw_mcp_modal(W, H)
     local fx = mx + pad + lblw + 8
     local fw = mw - (pad + lblw + 8) - pad
     local row = my + 48
-    if f.unsupported then
-        raygui.label(mx + pad, row, mw - 2 * pad, 22, '此服务器使用 stdio 方式，codua 目前只支持 http/sse。')
-        raygui.label(mx + pad, row + 26, mw - 2 * pad, 22, '可以删除，或改用 HTTP 方式启动该服务后重新添加。')
-    else
-        local function fld(label, id)
-            raygui.label(mx + pad, row + 4, lblw, 22, label)
-            f[id], f[id .. '_e'] = raygui.textbox(fx, row, fw, rh - 4, f[id], f[id .. '_e'])
-            row = row + rh + 6
-        end
-        fld('名称', 'name')
-        fld('地址', 'url')
-        raygui.label(mx + pad, row + 4, lblw, 22, '类型')
-        local bw = fw / 2 - 4
-        for i, t in ipairs({ { 'http', 'HTTP (Streamable)' }, { 'sse', 'SSE' } }) do
-            local bx = fx + (i - 1) * (bw + 8)
-            if f.type == t[1] then raygui.draw_rectangle(bx, row + rh - 3, bw, 3, ac[1], ac[2], ac[3], 255) end
-            if raygui.button(bx, row, bw, rh - 4, t[2]) then f.type = t[1] end
-        end
+    local function fld(label, id)
+        raygui.label(mx + pad, row + 4, lblw, 22, label)
+        f[id], f[id .. '_e'] = raygui.textbox(fx, row, fw, rh - 4, f[id], f[id .. '_e'])
         row = row + rh + 6
+    end
+    fld('名称', 'name')
+    raygui.label(mx + pad, row + 4, lblw, 22, '类型')
+    local bw = (fw - 16) / 3
+    for i, t in ipairs(MCP_TYPES) do
+        local bx = fx + (i - 1) * (bw + 8)
+        if f.type == t[1] then raygui.draw_rectangle(bx, row + rh - 3, bw, 3, ac[1], ac[2], ac[3], 255) end
+        if raygui.button(bx, row, bw, rh - 4, t[2]) then f.type = t[1]; f.err = nil end
+    end
+    row = row + rh + 6
+    if stdio then
+        fld('命令', 'command')
+        fld('参数', 'args')
+    else
+        fld('地址', 'url')
+    end
 
-        raygui.label(mx + pad, row, mw - 2 * pad, 22,
-            '请求头（可选）：已有的值不显示，留空=不变，清空名称=删除')
-        row = row + 26
-        local kw = 150
-        for i, h in ipairs(f.headers) do
-            raygui.label(mx + pad, row + 4, lblw, 22, '请求头 ' .. i)
-            h.key, h.key_e = raygui.textbox(fx, row, kw, rh - 4, h.key, h.key_e)
-            h.val, h.val_e = raygui.textbox(fx + kw + 6, row, fw - kw - 6, rh - 4, h.val, h.val_e)
-            if h.orig and h.val == '' and not h.val_e then
-                raygui.label(fx + kw + 14, row + 3, fw - kw - 20, 22, '（已设置）')
-            end
-            row = row + rh + 6
-        end
-        if #f.headers < MCP_MAX_HEADERS and raygui.button(fx, row, 120, rh - 4, '+ 请求头') then
-            f.headers[#f.headers + 1] = { key = '', val = '' }
+    local what = stdio and '环境变量' or '请求头'
+    raygui.label(mx + pad, row, mw - 2 * pad, 22,
+        what .. '（可选）：已有的值不显示，留空=不变，清空名称=删除')
+    row = row + 26
+    local kw = 170
+    for i, h in ipairs(rows) do
+        raygui.label(mx + pad, row + 4, lblw, 22, (stdio and '变量 ' or '请求头 ') .. i)
+        h.key, h.key_e = raygui.textbox(fx, row, kw, rh - 4, h.key, h.key_e)
+        h.val, h.val_e = raygui.textbox(fx + kw + 6, row, fw - kw - 6, rh - 4, h.val, h.val_e)
+        if h.orig and h.val == '' and not h.val_e then
+            raygui.label(fx + kw + 14, row + 3, fw - kw - 20, 22, '（已设置）')
         end
         row = row + rh + 6
     end
+    if #rows < MCP_MAX_PAIRS and raygui.button(fx, row, 120, rh - 4, '+ ' .. what) then
+        rows[#rows + 1] = { key = '', val = '' }
+    end
+    row = row + rh + 6
 
     if f.err then
         local ec = { 220, 90, 90, 255 }
@@ -1883,7 +1970,7 @@ local function draw_mcp_modal(W, H)
             end
         end
     end
-    if not f.unsupported and raygui.button(mx + mw - 16 - 96 - 8 - 96, by, 96, 30, '保存') then
+    if raygui.button(mx + mw - 16 - 96 - 8 - 96, by, 96, 30, '保存') then
         if S.mcp_status == 'connecting' then
             f.err = 'MCP 正在连接，请稍后再保存'
         else
@@ -1924,8 +2011,8 @@ local function draw_mcp_section(pad, y, H)
         end
         local entry = mcp_registry.get(c.name)
         local project = c.config and c.config.scope == 'project'
-        local label = string.format('%s %s  ·  %d 工具%s', mcp_status_icon(c), sanitize_label(c.name),
-            entry and #entry.tools or 0, project and '  ·  项目' or '')
+        local label = string.format('%s %s  ·  %s  ·  %d 工具%s', mcp_status_icon(c), sanitize_label(c.name),
+            c.config and c.config.type or '?', entry and #entry.tools or 0, project and '  ·  项目' or '')
         if raygui.button(pad, ry, SIDEBAR_W - 2 * pad, 26, label) then open_mcp_form(c.name) end
         ry = ry + 30
         if c.error and ry + 22 <= H - 8 then
@@ -2464,6 +2551,7 @@ end
 
 local function __uninit()
     oauth_login.cancel()
+    mcp.shutdown()             -- stdio MCP servers must not outlive the GUI
     -- Join the process workers while this state is still alive (see xproc.shutdown).
     subprocess.shutdown()
     if S.started then raygui.close() end

@@ -199,6 +199,7 @@ return {
     __thread_handle = router.handle,
     __init = __init,
     __uninit = function()
+        mcp.shutdown()         -- stdio MCP servers must not outlive the agent
         -- Join the process workers while this state is still alive (see xproc.shutdown).
         subprocess.shutdown()
         if xnet and xnet.uninit then xnet.uninit() end
