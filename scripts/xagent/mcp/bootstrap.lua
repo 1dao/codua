@@ -10,6 +10,9 @@
 --
 -- MUST run inside the agent coroutine (every connect/list awaits). Best-effort:
 -- one server failing or timing out never blocks the others or throws.
+--
+-- Calling it again is a reload: the previous servers' tools are retired from
+-- the tool registry first, so removed or renamed servers leave nothing behind.
 
 local config       = require('xagent.mcp.config')
 local client       = require('xagent.mcp.client')
@@ -27,8 +30,11 @@ local resource_tools_registered = false
 --     servers = { { name, status, tools, error }, ... } }
 function M.bootstrap(cwd, opts)
     opts = opts or {}
-    local servers, errors = config.load(cwd)
+    local servers, errors = config.load(cwd, opts.user_file)
 
+    for _, entry in ipairs(mcp_registry.all()) do
+        for _, t in ipairs(entry.tools) do tool_registry.unregister(t.name) end
+    end
     mcp_registry.clear()
     local summary = {
         connected = 0, failed = 0, unsupported = 0, tool_count = 0,
@@ -75,9 +81,14 @@ function M.bootstrap(cwd, opts)
         tool_registry.register(require('xagent.tools.list_mcp_resources'))
         tool_registry.register(require('xagent.tools.read_mcp_resource'))
         resource_tools_registered = true
+    elseif not any_resources and resource_tools_registered then
+        tool_registry.unregister(require('xagent.tools.list_mcp_resources').name)
+        tool_registry.unregister(require('xagent.tools.read_mcp_resource').name)
+        resource_tools_registered = false
     end
 
     return summary
 end
+
 
 return M

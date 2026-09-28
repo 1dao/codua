@@ -165,6 +165,79 @@ spec.describe('mcp.config.load (project .mcp.json)', function()
     end)
 end)
 
+spec.describe('mcp.config user-file editing', function()
+    local dir = (fs.home():gsub('[/\\]+$', '')) .. '/.xagent/_mcp_spec_tmp'
+    local path = dir .. '/mcp.json'
+    local function reset(data)
+        fs.mkdirp(dir)
+        os.remove(path)
+        if data then assert(fs.write_file(path, data)) end
+    end
+
+    spec.it('creates the file, keeps other keys and fields, and loads back', function()
+        reset('{"other":1,"mcpServers":{"keep":{"command":"x","args":[],"note":"n"}}}')
+        spec.truthy(config.save_user_server('web', { type = 'http', url = 'http://127.0.0.1:1/mcp',
+            headers = { Authorization = 'Bearer t' } }, nil, path))
+        local doc, servers = config.read_user(path)
+        spec.equal(doc.other, 1)
+        spec.equal(servers.keep.note, 'n')
+        spec.equal(servers.web.headers.Authorization, 'Bearer t')
+        local text = fs.read_file(path)
+        spec.contains(text, '"args": []')          -- empty array stays an array
+        spec.contains(text, '\n  "mcpServers": {')   -- pretty-printed for hand edits
+        local loaded = config.load(nil, path)
+        spec.equal(loaded.web.type, 'http')
+        spec.equal(loaded.web.scope, 'user')
+    end)
+
+    spec.it('renames, refuses name clashes and invalid entries', function()
+        reset('{"mcpServers":{"a":{"url":"http://h/a"},"b":{"url":"http://h/b"}}}')
+        local ok, err = config.save_user_server('b', { url = 'http://h/a2' }, 'a', path)
+        spec.nil_value(ok); spec.contains(err, 'already exists')
+        spec.truthy(config.save_user_server('c', { url = 'http://h/a2' }, 'a', path))
+        local _, servers = config.read_user(path)
+        spec.nil_value(servers.a)
+        spec.equal(servers.c.url, 'http://h/a2')
+        ok, err = config.save_user_server('bad name', { url = 'http://h' }, nil, path)
+        spec.nil_value(ok); spec.contains(err, 'name')
+        ok = config.save_user_server('d', { type = 'http' }, nil, path)
+        spec.nil_value(ok)
+        spec.nil_value(select(2, config.read_user(path)).d)
+    end)
+
+    spec.it('removes entries and never overwrites an unparsable file', function()
+        reset('{"mcpServers":{"a":{"url":"http://h/a"}}}')
+        spec.truthy(config.remove_user_server('a', path))
+        spec.equal(config.remove_user_server('a', path), false)
+        spec.contains(fs.read_file(path), '"mcpServers": {}')
+        reset('{broken')
+        local ok, err = config.save_user_server('a', { url = 'http://h' }, nil, path)
+        spec.nil_value(ok); spec.contains(err, 'invalid JSON')
+        spec.equal(fs.read_file(path), '{broken')
+        reset(nil)
+        os.remove(dir)
+    end)
+end)
+
+spec.describe('mcp.bootstrap reload', function()
+    spec.it('retires the previous servers\' tools from the tool registry', function()
+        local tool_registry = require('xagent.tools.registry')
+        local bootstrap = require('xagent.mcp.bootstrap')
+        local stale = { name = 'mcp__gone__t', description = '', input_schema = {}, call = function() end }
+        tool_registry.register(stale)
+        mcp_reg.clear()
+        mcp_reg.set('gone', { name = 'gone', status = 'connected' }, { stale })
+        local dir = (fs.home():gsub('[/\\]+$', '')) .. '/.xagent/_mcp_spec_tmp'
+        fs.mkdirp(dir)
+        local summary = bootstrap.bootstrap(dir, { user_file = dir .. '/absent.json' })
+        spec.equal(summary.connected, 0)
+        spec.nil_value(tool_registry.find('mcp__gone__t'))
+        spec.equal(#mcp_reg.connections(), 0)
+        for _, t in ipairs(tool_registry.all()) do spec.truthy(t.name ~= 'mcp__gone__t') end
+        os.remove(dir)
+    end)
+end)
+
 spec.describe('mcp.transport_http.parse_body', function()
     spec.it('parses a single application/json response', function()
         local objs = assert(http.parse_body('application/json',

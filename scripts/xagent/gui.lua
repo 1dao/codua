@@ -125,6 +125,8 @@ local S = {
     dd_anchor = nil,           -- { x, y, w } of the open dropdown button
     model_sel = 1,             -- selected profile index in the model dropdown
     add_model = nil,           -- the add-model form state while it's open
+    mcp_form = nil,            -- the MCP server form state while it's open
+    mcp_cwd = nil,             -- directory whose .mcp.json the MCP servers came from
     -- tool permission mode: 'write' = auto-run (default), 'ask' = confirm each
     -- state-changing tool before it runs. The parked await lives per-tab.
     mode = 'write',
@@ -435,6 +437,138 @@ end
 
 -- Slash commands handled locally (not sent to the model). Returns true if the
 -- input was a command (and was consumed).
+-- ── MCP servers: shared by /mcp and the settings panel ──────────────────────
+-- Only the user file (~/.xagent/mcp.json) is edited here; project .mcp.json
+-- entries are listed but stay hand-edited. Every change reconnects all servers.
+local mcp_config = require('xagent.mcp.config')
+
+-- Connect (or reconnect) every configured server. Runs inside a coroutine.
+local function mcp_connect(reloading)
+    S.mcp_status = 'connecting'
+    local p = S.profiles and S.profiles[1]
+    local summary = mcp.bootstrap(S.mcp_cwd or '.', { verify = p and p.verify })
+    S.mcp_status = 'ready'
+    local params = registry.to_api_params()
+    for _, tab in ipairs(S.tabs) do
+        if tab.sess then tab.sess.tools = params end
+    end
+    if reloading then
+        add(T(), 'system', string.format('✓ MCP 已重新加载：%d 个服务器已连接，共 %d 个工具',
+            summary.connected, summary.tool_count))
+    elseif summary.tool_count > 0 then
+        add(T(), 'system', string.format('✓ MCP：%d 个服务器已连接，新增 %d 个工具',
+            summary.connected, summary.tool_count))
+    elseif summary.connected > 0 then
+        add(T(), 'system', string.format('✓ MCP：%d 个服务器已连接（无工具）', summary.connected))
+    end
+    for _, e in ipairs(summary.errors) do add(T(), 'error', 'MCP: ' .. tostring(e)) end
+end
+
+local function reload_mcp()
+    if S.mcp_status == 'connecting' then
+        add(T(), 'system', 'MCP 正在连接，请稍后再试')
+        return false
+    end
+    S.mcp_status = 'connecting'
+    local ok, err = coroutine.resume(coroutine.create(function() mcp_connect(true) end))
+    if not ok then S.mcp_status = 'error'; add(T(), 'error', 'MCP 重新加载失败: ' .. tostring(err)) end
+    return ok
+end
+
+local function mcp_status_icon(c)
+    return (c.status == 'connected' and '●') or (c.status == 'pending' and '◐') or '○'
+end
+
+local function mcp_status_text()
+    local lines = { 'MCP 服务器（用户配置 ~/.xagent/mcp.json）:' }
+    local conns = mcp_registry.connections()
+    if S.mcp_status == 'connecting' then lines[#lines + 1] = '（连接中…）' end
+    if #conns == 0 and S.mcp_status ~= 'connecting' then
+        lines[#lines + 1] = '（未配置）'
+    end
+    for _, c in ipairs(conns) do
+        local entry = mcp_registry.get(c.name)
+        local line = string.format('%s %s  [%s]  %d 工具%s', mcp_status_icon(c), c.name, c.status,
+            entry and #entry.tools or 0, (c.config and c.config.scope == 'project') and '  · 项目配置' or '')
+        if c.error then line = line .. '  — ' .. tostring(c.error) end
+        lines[#lines + 1] = line
+    end
+    lines[#lines + 1] = ''
+    lines[#lines + 1] = '/mcp add <名称> <url> [--sse] [-H "Key: Value"]...  添加或更新'
+    lines[#lines + 1] = '/mcp remove <名称>  删除   /mcp reload  重新连接'
+    lines[#lines + 1] = '也可在设置（齿轮）→ MCP 服务器 中管理'
+    return table.concat(lines, '\n')
+end
+
+-- Split command arguments on whitespace; "..." or '...' keeps spaces.
+local function split_args(s)
+    local out, i = {}, 1
+    while true do
+        i = s:find('%S', i)
+        if not i then return out end
+        local q = s:sub(i, i)
+        if q == '"' or q == "'" then
+            local j = s:find(q, i + 1, true)
+            if not j then return nil, '引号未闭合' end
+            out[#out + 1] = s:sub(i + 1, j - 1)
+            i = j + 1
+        else
+            local j = s:find('%s', i) or (#s + 1)
+            out[#out + 1] = s:sub(i, j - 1)
+            i = j
+        end
+    end
+end
+
+-- Warn when a project .mcp.json entry of the same name shadows a user entry.
+local function mcp_shadow_note(name)
+    local servers = mcp_config.load(S.mcp_cwd or '.')
+    if servers[name] and servers[name].scope == 'project' then
+        add(T(), 'system', '注意：当前目录 .mcp.json 中的同名服务器 ' .. name .. ' 会覆盖用户配置')
+    end
+end
+
+-- /mcp add <name> <url> [--sse] [-H "Key: Value"]... — add or replace a user
+-- server, keeping any fields of an existing entry this command does not set
+-- (headers included, unless -H is given).
+local function mcp_add_command(args)
+    local name, url = args[2], args[3]
+    if not name or not url then return nil, '用法: /mcp add <名称> <url> [--sse] [-H "Key: Value"]...' end
+    local ok = mcp_config.check_name(name)
+    if not ok then return nil, '名称只能包含字母、数字、_ 和 -（最长 64）' end
+    if not url:match('^https?://.+') then return nil, 'url 需以 http:// 或 https:// 开头' end
+    local kind, headers = 'http', nil
+    local i = 4
+    while args[i] do
+        local a = args[i]
+        if a == '--sse' then
+            kind = 'sse'
+        elseif a == '-H' or a == '--header' then
+            local h = args[i + 1]
+            local k, v = (h or ''):match('^%s*([^:]-)%s*:%s*(.-)%s*$')
+            if not k or k == '' or v == '' then return nil, '请求头格式应为 "Key: Value"' end
+            headers = headers or {}
+            headers[k] = v
+            i = i + 1
+        else
+            return nil, '未知参数: ' .. a
+        end
+        i = i + 1
+    end
+    local doc, servers = mcp_config.read_user()
+    if not doc then return nil, servers end
+    local raw = {}
+    if type(servers[name]) == 'table' then
+        for k, v in pairs(servers[name]) do raw[k] = v end
+    end
+    raw.type, raw.url = kind, url
+    if headers then raw.headers = headers end     -- no -H keeps the existing headers
+    raw.command, raw.args, raw.env = nil, nil, nil
+    local saved, err = mcp_config.save_user_server(name, raw)
+    if not saved then return nil, err end
+    return servers[name] ~= nil and 'updated' or 'added'
+end
+
 local function handle_slash(text)
     local orig_cmd, rest = text:match('^/(%S+)%s*(.*)$')
     if not orig_cmd then return false end
@@ -468,31 +602,44 @@ local function handle_slash(text)
         return true
     elseif cmd == 'mcp' then
         tab.input = ''
-        local lines = { 'MCP 服务器:' }
-        local conns = mcp_registry.connections()
-        if S.mcp_status == 'connecting' then
-            lines[#lines + 1] = '（连接中…）'
-        end
-        if #conns == 0 then
-            lines[#lines + 1] = '（未配置；在 ~/.xagent/mcp.json 或 <当前目录>/.mcp.json ' ..
-                '中添加 mcpServers，重启后生效）'
-        else
-            for _, c in ipairs(conns) do
-                local entry = mcp_registry.get(c.name)
-                local n = entry and #entry.tools or 0
-                local icon = (c.status == 'connected' and '●')
-                    or (c.status == 'pending' and '◐') or '○'
-                local line = string.format('%s %s  [%s]  %d 工具', icon, c.name, c.status, n)
-                if c.error then line = line .. '  — ' .. tostring(c.error) end
-                lines[#lines + 1] = line
+        local args, perr = split_args(rest)
+        local sub = args and (args[1] or 'list'):lower()
+        if not args then
+            add(tab, 'error', 'MCP: ' .. perr)
+        elseif sub == 'list' then
+            add(tab, 'system', mcp_status_text())
+        elseif sub == 'reload' then
+            reload_mcp()
+        elseif sub == 'add' then
+            local result, err = mcp_add_command(args)
+            if not result then
+                add(tab, 'error', 'MCP: ' .. tostring(err))
+            else
+                add(tab, 'system', (result == 'updated' and '已更新 ' or '已添加 ') .. args[2] .. '，正在重新连接…')
+                mcp_shadow_note(args[2])
+                reload_mcp()
             end
+        elseif sub == 'remove' or sub == 'rm' then
+            local name = args[2]
+            local removed, err = name and mcp_config.remove_user_server(name)
+            if not name then
+                add(tab, 'error', 'MCP: 用法: /mcp remove <名称>')
+            elseif removed == nil then
+                add(tab, 'error', 'MCP: ' .. tostring(err))
+            elseif not removed then
+                add(tab, 'error', 'MCP: 用户配置中没有 ' .. name .. '（项目 .mcp.json 中的服务器需直接编辑该文件）')
+            else
+                add(tab, 'system', '已删除 ' .. name .. '，正在重新连接…')
+                reload_mcp()
+            end
+        else
+            add(tab, 'error', 'MCP: 未知子命令 ' .. sub .. '（可用 list / add / remove / reload）')
         end
-        add(tab, 'system', table.concat(lines, '\n'))
         return true
     elseif cmd == 'help' then
         tab.input = ''
         local lines = { '可用命令:', '/compact [重点]  压缩上下文', '/context  查看上下文用量',
-                        '/mcp  查看 MCP 服务器', '/new  新会话（当前标签）', '/help  帮助',
+                        '/mcp [add|remove|reload]  查看或管理 MCP 服务器', '/new  新会话（当前标签）', '/help  帮助',
                         '（顶部 + 新建标签可同时跑多个模型）' }
         local sk = require('xagent.skills').all_user_invocable()
         if #sk > 0 then
@@ -1080,7 +1227,7 @@ local function slash_items()
     local items = {
         { name = 'compact', desc = '压缩上下文' },
         { name = 'context', desc = '查看上下文用量' },
-        { name = 'mcp',     desc = '查看 MCP 服务器' },
+        { name = 'mcp',     desc = '查看/管理 MCP 服务器（add/remove/reload）' },
         { name = 'new',     desc = '新会话' },
         { name = 'help',    desc = '帮助' },
     }
@@ -1100,7 +1247,7 @@ local completion_deps = { slash_items = slash_items, list_dir = list_dir_cached 
 local function update_completion_menu()
     S.menu = nil
     local tab = T()
-    if tab.busy or S.dir_dialog or tab.pending_confirm or S.tab_picker or S.add_model then return end
+    if tab.busy or S.dir_dialog or tab.pending_confirm or S.tab_picker or S.add_model or S.mcp_form then return end
     local menu = complete.compute(tab.input, completion_deps)
     if not menu then S.menu_dismissed_for = nil; return end
     if raygui.is_key_pressed and raygui.is_key_pressed(raygui.KEY_ESCAPE) then
@@ -1586,6 +1733,210 @@ local function draw_add_model_modal(W, H)
     if raygui.button(mx + mw - 16 - 96, my + mh - 44, 96, 30, '取消') then oauth_login.cancel(); S.add_model = nil end
 end
 
+-- ── MCP server form (settings → MCP 服务器) ─────────────────────────────────
+-- Edits one entry of the user file. Existing header values are never shown:
+-- a blank value keeps the stored one (like the model form's Token), and
+-- clearing a header's key removes it.
+local MCP_MAX_HEADERS = 6
+
+local function trim(s) return ((s or ''):gsub('^%s+', ''):gsub('%s+$', '')) end
+
+local function open_mcp_form(name)
+    S.dd_open = nil
+    local f = { name = '', url = 'http://', type = 'http', headers = {}, err = nil }
+    if name then
+        local doc, servers = mcp_config.read_user()
+        if not doc then add(T(), 'error', 'MCP: ' .. tostring(servers)); return end
+        local raw = servers[name]
+        if type(raw) ~= 'table' then
+            add(T(), 'system', name .. ' 来自当前目录的 .mcp.json（项目配置），请直接编辑该文件')
+            return
+        end
+        f.edit, f.raw, f.name = name, raw, name
+        f.url = type(raw.url) == 'string' and raw.url or ''
+        f.type = raw.type == 'sse' and 'sse' or 'http'
+        if raw.command ~= nil or (raw.type ~= nil and raw.type ~= 'http' and raw.type ~= 'sse') then
+            f.unsupported = true      -- stdio: codua cannot connect it; offer delete only
+        end
+        local keys = {}
+        if type(raw.headers) == 'table' then
+            for k in pairs(raw.headers) do keys[#keys + 1] = k end
+        end
+        table.sort(keys)
+        for _, k in ipairs(keys) do
+            f.headers[#f.headers + 1] = { key = k, val = '', orig = k }
+        end
+    end
+    if #f.headers < MCP_MAX_HEADERS then f.headers[#f.headers + 1] = { key = '', val = '' } end
+    S.mcp_form = f
+end
+
+local function save_mcp_form(f)
+    local name, url = trim(f.name), trim(f.url)
+    if not mcp_config.check_name(name) then return nil, '名称只能包含字母、数字、_ 和 -（最长 64）' end
+    if not url:match('^https?://.+') then return nil, '地址需以 http:// 或 https:// 开头' end
+    local old = f.raw and type(f.raw.headers) == 'table' and f.raw.headers or {}
+    local headers, seen = {}, {}
+    for _, h in ipairs(f.headers) do
+        local k, v = trim(h.key), trim(h.val)
+        if k ~= '' then
+            if k:find('[%s:]') then return nil, '请求头名称不能包含空格或冒号: ' .. k end
+            if seen[k:lower()] then return nil, '请求头重复: ' .. k end
+            seen[k:lower()] = true
+            if v == '' and h.orig then v = old[h.orig] end
+            if type(v) ~= 'string' or v == '' then return nil, '请求头 ' .. k .. ' 缺少值' end
+            headers[k] = v
+        end
+    end
+    local raw = {}
+    for k, v in pairs(f.raw or {}) do raw[k] = v end
+    raw.type, raw.url = f.type, url
+    raw.headers = next(headers) and headers or nil
+    raw.command, raw.args, raw.env = nil, nil, nil
+    local ok, err = mcp_config.save_user_server(name, raw, f.edit)
+    if not ok then
+        if tostring(err):find('already exists', 1, true) then return nil, '已存在同名服务器: ' .. name end
+        return nil, err
+    end
+    return name
+end
+
+local function draw_mcp_modal(W, H)
+    local f = S.mcp_form
+    if not f then return end
+    if raygui.is_key_pressed and raygui.is_key_pressed(raygui.KEY_ESCAPE) then S.mcp_form = nil; return end
+    local pad, lblw, rh = 16, 84, 30
+    local nh = f.unsupported and 0 or #f.headers
+    local mw = 540
+    local mh = f.unsupported and 190 or (48 + 3 * (rh + 6) + 26 + nh * (rh + 6) + 36 + 30 + 56)
+    local mx, my = math.floor((W - mw) / 2), math.floor((H - mh) / 2)
+    raygui.draw_rectangle(mx - 2, my - 2, mw + 4, mh + 4, 0, 0, 0, 170)
+    local pb = S.sidebar_bg
+    raygui.draw_rectangle(mx, my, mw, mh, pb[1], pb[2], pb[3], 255)
+    local ac = (markdown.palette and markdown.palette.heading) or { 110, 170, 120, 255 }
+    raygui.draw_rectangle(mx, my, mw, 3, ac[1], ac[2], ac[3], 255)
+    raygui.label(mx + 16, my + 12, mw - 32, 24, f.edit
+        and ('编辑 MCP 服务器 · ' .. sanitize_label(f.edit)) or '添加 MCP 服务器')
+
+    local fx = mx + pad + lblw + 8
+    local fw = mw - (pad + lblw + 8) - pad
+    local row = my + 48
+    if f.unsupported then
+        raygui.label(mx + pad, row, mw - 2 * pad, 22, '此服务器使用 stdio 方式，codua 目前只支持 http/sse。')
+        raygui.label(mx + pad, row + 26, mw - 2 * pad, 22, '可以删除，或改用 HTTP 方式启动该服务后重新添加。')
+    else
+        local function fld(label, id)
+            raygui.label(mx + pad, row + 4, lblw, 22, label)
+            f[id], f[id .. '_e'] = raygui.textbox(fx, row, fw, rh - 4, f[id], f[id .. '_e'])
+            row = row + rh + 6
+        end
+        fld('名称', 'name')
+        fld('地址', 'url')
+        raygui.label(mx + pad, row + 4, lblw, 22, '类型')
+        local bw = fw / 2 - 4
+        for i, t in ipairs({ { 'http', 'HTTP (Streamable)' }, { 'sse', 'SSE' } }) do
+            local bx = fx + (i - 1) * (bw + 8)
+            if f.type == t[1] then raygui.draw_rectangle(bx, row + rh - 3, bw, 3, ac[1], ac[2], ac[3], 255) end
+            if raygui.button(bx, row, bw, rh - 4, t[2]) then f.type = t[1] end
+        end
+        row = row + rh + 6
+
+        raygui.label(mx + pad, row, mw - 2 * pad, 22,
+            '请求头（可选）：已有的值不显示，留空=不变，清空名称=删除')
+        row = row + 26
+        local kw = 150
+        for i, h in ipairs(f.headers) do
+            raygui.label(mx + pad, row + 4, lblw, 22, '请求头 ' .. i)
+            h.key, h.key_e = raygui.textbox(fx, row, kw, rh - 4, h.key, h.key_e)
+            h.val, h.val_e = raygui.textbox(fx + kw + 6, row, fw - kw - 6, rh - 4, h.val, h.val_e)
+            if h.orig and h.val == '' and not h.val_e then
+                raygui.label(fx + kw + 14, row + 3, fw - kw - 20, 22, '（已设置）')
+            end
+            row = row + rh + 6
+        end
+        if #f.headers < MCP_MAX_HEADERS and raygui.button(fx, row, 120, rh - 4, '+ 请求头') then
+            f.headers[#f.headers + 1] = { key = '', val = '' }
+        end
+        row = row + rh + 6
+    end
+
+    if f.err then
+        local ec = { 220, 90, 90, 255 }
+        raygui.draw_rectangle(mx + pad, row + 8, 6, 6, ec[1], ec[2], ec[3], 255)
+        raygui.label(mx + pad + 12, row + 4, mw - 2 * pad - 12, 22, f.err)
+    end
+
+    local by = my + mh - 44
+    if f.edit then
+        if raygui.button(mx + pad, by, 110, 30, f.confirm_delete and '确认删除' or '删除') then
+            if not f.confirm_delete then
+                f.confirm_delete = true
+            else
+                local ok, err = mcp_config.remove_user_server(f.edit)
+                if ok then
+                    S.mcp_form = nil
+                    add(T(), 'system', '已删除 MCP 服务器 ' .. f.edit .. '，正在重新连接…')
+                    reload_mcp()
+                    return
+                end
+                f.err = '删除失败: ' .. tostring(err or '用户配置中没有此服务器')
+            end
+        end
+    end
+    if not f.unsupported and raygui.button(mx + mw - 16 - 96 - 8 - 96, by, 96, 30, '保存') then
+        if S.mcp_status == 'connecting' then
+            f.err = 'MCP 正在连接，请稍后再保存'
+        else
+            local name, err = save_mcp_form(f)
+            if not name then
+                f.err = tostring(err)
+            else
+                S.mcp_form = nil
+                add(T(), 'system', (f.edit and '已更新' or '已添加') .. ' MCP 服务器 ' .. name .. '，正在重新连接…')
+                mcp_shadow_note(name)
+                reload_mcp()
+                return
+            end
+        end
+    end
+    if raygui.button(mx + mw - 16 - 96, by, 96, 30, '取消') then S.mcp_form = nil end
+end
+
+-- Settings sidebar section: one row per server (click = edit), plus 添加/重连.
+local function draw_mcp_section(pad, y, H)
+    raygui.label(pad, y + 2, SIDEBAR_W - 2 * pad - 130, 22, 'MCP 服务器')
+    if raygui.button(SIDEBAR_W - pad - 126, y, 60, 26, '添加') then open_mcp_form() end
+    local busy = S.mcp_status == 'connecting'
+    if raygui.button(SIDEBAR_W - pad - 60, y, 60, 26, busy and '连接中' or '重连') and not busy then
+        reload_mcp()
+    end
+    local ry = y + 32
+    local conns = mcp_registry.connections()
+    if #conns == 0 then
+        raygui.label(pad, ry, SIDEBAR_W - 2 * pad, 22, busy and '（连接中…）' or '（未配置，点击“添加”）')
+        return
+    end
+    for i, c in ipairs(conns) do
+        if ry + 28 > H - 8 then
+            raygui.label(pad, ry, SIDEBAR_W - 2 * pad, 22,
+                string.format('… 还有 %d 个（/mcp 查看全部）', #conns - i + 1))
+            return
+        end
+        local entry = mcp_registry.get(c.name)
+        local project = c.config and c.config.scope == 'project'
+        local label = string.format('%s %s  ·  %d 工具%s', mcp_status_icon(c), sanitize_label(c.name),
+            entry and #entry.tools or 0, project and '  ·  项目' or '')
+        if raygui.button(pad, ry, SIDEBAR_W - 2 * pad, 26, label) then open_mcp_form(c.name) end
+        ry = ry + 30
+        if c.error and ry + 22 <= H - 8 then
+            local e = tostring(c.error)
+            if utf8.len(e) and utf8.len(e) > 30 then e = e:sub(1, utf8.offset(e, 30) - 1) .. '…' end
+            raygui.label(pad + 8, ry - 4, SIDEBAR_W - 2 * pad - 8, 20, sanitize_label(e))
+            ry = ry + 20
+        end
+    end
+end
+
 local function __init()
     S.profiles = config.load_profiles()
     assert(xnet.init())
@@ -1654,6 +2005,7 @@ local function __init()
     -- register globally, so we refresh every live tab's tools param when done
     -- (new/resumed sessions pick them up automatically at creation).
     S.mcp_status = 'connecting'
+    S.mcp_cwd = cwd          -- reloads read the same project .mcp.json
     local boot_co = coroutine.create(function()
         -- Prove the process workers answer before any tool call rides on one.
         -- A dead worker would otherwise show up as the first Bash mysteriously
@@ -1666,18 +2018,7 @@ local function __init()
         -- it isn't wrapped in pcall (yielding across pcall isn't safe on every
         -- Lua backend); a stray error surfaces via the resume check below or, on
         -- a later resume, xasync's resume-error log.
-        local summary = mcp.bootstrap(cwd, { verify = S.profiles[1].verify })
-        S.mcp_status = 'ready'
-        if summary.tool_count > 0 then
-            for _, tab in ipairs(S.tabs) do
-                if tab.sess then tab.sess.tools = registry.to_api_params() end
-            end
-            add(T(), 'system', string.format('✓ MCP：%d 个服务器已连接，新增 %d 个工具',
-                summary.connected, summary.tool_count))
-        elseif summary.connected > 0 then
-            add(T(), 'system', string.format('✓ MCP：%d 个服务器已连接（无工具）', summary.connected))
-        end
-        for _, e in ipairs(summary.errors) do add(T(), 'error', 'MCP: ' .. tostring(e)) end
+        mcp_connect(false)
     end)
     local ok, err = coroutine.resume(boot_co)
     if not ok then S.mcp_status = 'error'; add(T(), 'error', 'MCP 启动失败: ' .. tostring(err)) end
@@ -1700,8 +2041,9 @@ local function __update()
     -- directory dialog open: freeze the UI underneath (raygui controls via
     -- lock; custom-drawn transcript/list wheel via flags). Unlocked again just
     -- before the dialog itself is drawn at the end of the frame.
-    if S.dir_dialog or S.add_model or S.dd_open then raygui.lock() end
-    tab.view.lock_input = (S.dir_dialog or S.add_model or S.dd_open) or nil
+    local modal = S.dir_dialog or S.add_model or S.mcp_form or S.dd_open
+    if modal then raygui.lock() end
+    tab.view.lock_input = modal or nil
 
     -- top bar: title/status + context meter + settings + history toggles
     S.frame = S.frame + 1
@@ -1937,6 +2279,7 @@ local function __update()
 
             -- selected model details (+ delete for user-added ones)
             local dy = my0 + 64
+            local mcp_y = dy + 8
             if selp then
                 local function det(s) raygui.label(pad, dy, SIDEBAR_W - 2 * pad, 20, s); dy = dy + 22 end
                 det('地址: ' .. sanitize_label(selp.base_url or '?'))
@@ -1960,7 +2303,9 @@ local function __update()
                         reload_profiles()
                     end
                 end
+                mcp_y = dy + 44
             end
+            draw_mcp_section(pad, mcp_y, H)
         end
     end
 
@@ -2006,7 +2351,7 @@ local function __update()
     local submitted, new_edit
     tab.input, new_edit, submitted = raygui.textbox_multi(
         lx + 8, iy, W - lx - 16, input_h, tab.input,
-        (not S.dir_dialog and not S.add_model and not S.dd_open) and tab.input_edit or false, true)
+        (not modal) and tab.input_edit or false, true)
 
     -- live / @ autocomplete menu, recomputed from the (possibly edited) input
     update_completion_menu()
@@ -2105,6 +2450,10 @@ local function __update()
     if S.add_model then
         raygui.unlock()
         draw_add_model_modal(W, H)
+    end
+    if S.mcp_form then
+        raygui.unlock()
+        draw_mcp_modal(W, H)
     end
 
     -- open dropdown list: topmost overlay; unlocks the background it was drawn over.

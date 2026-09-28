@@ -19,6 +19,15 @@ function M.register(tool)
     return tool
 end
 
+-- Drop a tool (MCP reload retires the previous server's tools). No-op if absent.
+function M.unregister(name)
+    if not tools[name] then return end
+    tools[name] = nil
+    for i, n in ipairs(order) do
+        if n == name then table.remove(order, i); break end
+    end
+end
+
 function M.find(name)
     return tools[name]
 end
