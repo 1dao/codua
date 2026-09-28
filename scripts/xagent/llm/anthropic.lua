@@ -78,10 +78,13 @@ end
 -- History may hold tool_use blocks decoded by the OpenAI codec, which keeps
 -- Gemini's thought signature on them as `extra_content` (a tab can switch
 -- models mid-conversation). Anthropic rejects unknown block fields, so send a
--- copy without it; untouched messages are passed through as-is.
+-- copy without it; untouched messages are passed through as-is. A message left
+-- with no blocks (e.g. a Responses turn that only reasoned) is dropped: empty
+-- content is rejected, and {} would even encode as an object. The API merges
+-- the consecutive same-role turns this can leave behind.
 local function wire_messages(messages)
     local out = {}
-    for i, m in ipairs(messages or {}) do
+    for _, m in ipairs(messages or {}) do
         local c = m.content
         if type(c) == 'table' then
             local filtered = {}
@@ -111,7 +114,7 @@ local function wire_messages(messages)
                 m = nm
             end
         end
-        out[i] = m
+        if type(c) ~= 'table' or #c > 0 then out[#out + 1] = m end
     end
     return out
 end

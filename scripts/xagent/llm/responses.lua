@@ -72,7 +72,10 @@ end
 
 function M.build_request(cfg, params)
     local codex = cfg.auth_type == 'chatgpt'
-    local body = { model = params.model or cfg.model, input = M.convert_messages(params.messages),
+    -- Tagged so an empty history still encodes as "input":[]. Arrays decoded
+    -- from JSON (reasoning.summary, content, tool schemas) carry the tag already.
+    local input = setmetatable(M.convert_messages(params.messages), json.json_array_mt)
+    local body = { model = params.model or cfg.model, input = input,
         instructions = text_of(params.system), stream = true, store = false,
         include = { 'reasoning.encrypted_content' } }
     if not codex then body.max_output_tokens = params.max_tokens or cfg.max_tokens or 4096 end
@@ -94,20 +97,8 @@ function M.build_request(cfg, params)
     local headers = { ['Content-Type'] = 'application/json', Accept = 'text/event-stream',
         Authorization = 'Bearer ' .. tostring(cfg.api_key or '') }
     if cfg.account_id then headers['ChatGPT-Account-Id'] = cfg.account_id end
-    -- Lua's JSON codec encodes an empty table as {}. Responses requires arrays
-    -- for input and reasoning.summary, including after a history reload.
-    local encode = common.json_encode or json.json_pack
-    local input = {}
-    for _, value in ipairs(body.input) do
-        if value.type == 'reasoning' and (not value.summary or #value.summary == 0) then
-            local copy = {}; for k, v in pairs(value) do if k ~= 'summary' then copy[k] = v end end
-            input[#input + 1] = assert(encode(copy)):sub(1, -2) .. ',"summary":[]}'
-        else input[#input + 1] = assert(encode(value)) end
-    end
-    body.input = nil
-    local encoded = assert(encode(body)):sub(1, -2) .. ',"input":[' .. table.concat(input, ',') .. ']}'
     return { url = codex and 'https://chatgpt.com/backend-api/codex/responses' or M.endpoint(cfg.base_url),
-        headers = headers, body = encoded }
+        headers = headers, body = assert(common.json_encode(body)) }
 end
 
 function M.new_decoder(cb)

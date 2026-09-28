@@ -42,12 +42,14 @@ spec.describe('Responses codec', function()
         spec.equal(out[1].content[1].image_url,'data:image/jpeg;base64,YWJj')
         spec.equal(out[2].output,'image'); spec.equal(out[3].content[1].type,'input_image')
     end)
-    spec.it('encodes empty reasoning summaries as arrays without changing history', function()
-        local reasoning = {type='reasoning',id='rs',summary={},encrypted_content='opaque'}
-        local r=codec.build_request({auth_type='chatgpt',model='test'},
-            {messages={{role='assistant',content={{type='thinking',responses_item=reasoning}}}}})
-        spec.contains(r.body,'"summary":[]')
-        spec.truthy(type(reasoning.summary)=='table')
+    spec.it('re-sends decoded empty reasoning arrays as arrays', function()
+        -- Decoded [] keeps xutils.json_array_mt, so it is re-sent as [], never {},
+        -- including after a history save and reload.
+        local reasoning=json.json_unpack('{"type":"reasoning","id":"rs","summary":[],"content":[],"encrypted_content":"opaque"}')
+        local history=json.json_unpack(json.json_pack({{role='assistant',content={{type='thinking',responses_item=reasoning}}}}))
+        local r=codec.build_request({auth_type='chatgpt',model='test'},{messages=history})
+        spec.contains(r.body,'"summary":[]'); spec.contains(r.body,'"content":[]')
+        spec.nil_value(r.body:find(':{}',1,true))
         r=codec.build_request({model='test'},{messages={}})
         spec.contains(r.body,'"input":[]')
     end)
@@ -93,6 +95,12 @@ spec.describe('Responses codec', function()
             {type='text',text='hello'}}}}
         local wire=a._wire_messages(messages)
         spec.equal(#wire[1].content,1);spec.equal(#messages[1].content,2)
+        wire=a._wire_messages({{role='user',content='hi'},
+            {role='assistant',content={{type='thinking',thinking='',responses_item={type='reasoning'}}}},
+            {role='user',content='again'}})
+        spec.equal(#wire,2);spec.equal(wire[2].content,'again')
+        spec.nil_value(a.build_request({model='m',api_key='k'},{messages={{role='assistant',content={}},
+            {role='user',content='x'}}}).body:find('"content":{}',1,true))
     end)
 end)
 local failures=spec.finish()
