@@ -1,6 +1,11 @@
 -- xagent/context/system_prompt.lua — build the system prompt.
--- M1 slice: identity + concise coding instructions + environment. Memory
--- (AGENT.md / CLAUDE.md), skills, agents, etc. are added in later milestones.
+--
+-- One file for every host (the desktop GUI / headless runner here, the Android
+-- app in codua2a): the coding rules, the project memory and the MCP server
+-- instructions are shared. A host that needs its own identity or platform
+-- rules registers hooks (set_hooks) instead of assembling a prompt of its own,
+-- so a rule added here reaches every host. Without hooks, build() is the
+-- desktop prompt.
 
 local text = dofile('scripts/core/share/xtext.lua')
 
@@ -27,10 +32,24 @@ local CODING = {
     -- Every round-trip resends the whole conversation, so fewer turns and
     -- smaller tool results are the main lever on token cost.
     'When several tool calls do not depend on each other (reading multiple files, unrelated searches), issue them together in one response instead of one per turn.',
-    'For large files, locate the relevant part with Grep first, then Read only that range with offset/limit instead of the whole file; do not re-read content already in the conversation.',
+    -- Tool descriptions lose to "search" wording in the prompt, so the prompt
+    -- names CodeExplore as the first step itself.
+    'When the CodeExplore tool is available, use it first to locate or understand code: name the functions, classes or files involved and it returns their source, callers and callees in one call. Use Grep for text that is not a symbol (strings, config keys, log messages) or when CodeExplore finds nothing.',
+    'For large files, locate the relevant part first (CodeExplore, else Grep), then Read only that range with offset/limit instead of the whole file; do not re-read content already in the conversation.',
     M.DOCS_LOOKUP,
     'When you have finished the task, stop and give a short summary of what you did or found.',
 }
+
+-- Host hooks, each `function(opts) -> string` (opts as passed to build):
+--   identity    replaces IDENTITY (who the assistant is, workspace boundary)
+--   environment replaces the Environment section
+--   append      extra platform rules, after the coding rules and project
+--               memory and before the MCP section, so it can override them
+local hooks = {}
+
+function M.set_hooks(h)
+    hooks = h or {}
+end
 
 local function env_section(opts)
     local lines = {
@@ -58,18 +77,26 @@ function M.mcp_section(list)
     return text.valid_utf8(table.concat(parts, '\n\n'))
 end
 
--- opts: { cwd, os?, project_md?, mcp_instructions? }
+-- opts: { cwd, os?, project_md?, mcp_instructions?, ... } — extra fields are
+-- passed through to the hooks (Android passes skill_id).
 function M.build(opts)
     opts = opts or {}
     local parts = {}
-    for _, s in ipairs(IDENTITY) do parts[#parts + 1] = s end
-    for _, s in ipairs(CODING) do parts[#parts + 1] = s end
-    parts[#parts + 1] = env_section(opts)
-    if opts.project_md and opts.project_md ~= '' then
-        parts[#parts + 1] = 'Project memory (from AGENT.md / CLAUDE.md — follow it):\n' .. opts.project_md
+    local function add(s)
+        if s and s ~= '' then parts[#parts + 1] = s end
     end
-    local mcp = M.mcp_section(opts.mcp_instructions)
-    if mcp ~= '' then parts[#parts + 1] = mcp end
+    if hooks.identity then
+        add(hooks.identity(opts))
+    else
+        for _, s in ipairs(IDENTITY) do add(s) end
+    end
+    for _, s in ipairs(CODING) do add(s) end
+    add(hooks.environment and hooks.environment(opts) or env_section(opts))
+    if opts.project_md and opts.project_md ~= '' then
+        add('Project memory (from AGENT.md / CLAUDE.md — follow it):\n' .. opts.project_md)
+    end
+    if hooks.append then add(hooks.append(opts)) end
+    add(M.mcp_section(opts.mcp_instructions))
     return table.concat(parts, '\n\n')
 end
 
