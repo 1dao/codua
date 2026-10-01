@@ -60,6 +60,7 @@ spec.describe('session skills listing', function()
             spec.equal(s.messages[1].content[2].text, listing)
             s:ensure_title()
             spec.equal(s.title, 'hello')
+            spec.equal(s.transcript[1].content, 'hello', 'the UI transcript must not show the listing')
         end)
     end)
 

@@ -1045,14 +1045,14 @@ local function load_history_item(it)
     s2.confirm = make_confirm(tab, s2)
     tab.sess = s2
     tab.cwd = s2.cwd or tab.cwd                   -- this tab follows the resumed session's dir
-    tab.entries = rebuild_entries(s2.messages)
+    tab.entries = rebuild_entries(s2.transcript)   -- full history, not the compacted context
     tab.cur, tab.text_tail, tab.busy = nil, '', false
     tab.budget = nil                              -- meter restarts on the next turn
     tab.pending_confirm = nil
     S.dir_cache, S.menu, S.menu_dismissed_for = {}, nil, nil   -- @ picker follows the new cwd
     clear_attachments(tab)
     S.sidebar = nil
-    tab.status = 'resumed (' .. #s2.messages .. ' msgs)'
+    tab.status = 'resumed (' .. #s2.transcript .. ' msgs)'
 end
 
 local function start_rename(it)
