@@ -407,6 +407,12 @@ spec.describe('mcp instructions → system prompt', function()
         spec.truthy(not sys:find(string.rep('x', 4001), 1, true), 'capped at 4000 bytes')
         spec.equal(system_prompt.build({ cwd = '.' }):find('MCP Server Instructions', 1, true), nil)
     end)
+
+    spec.it('tells the model to consult docs for library questions', function()
+        local sys = system_prompt.build({ cwd = '.' })
+        spec.contains(sys, system_prompt.DOCS_LOOKUP)
+        spec.contains(sys, 'instead of searching the workspace')
+    end)
 end)
 
 return {

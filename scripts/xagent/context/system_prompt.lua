@@ -6,6 +6,12 @@ local text = dofile('scripts/core/share/xtext.lua')
 
 local M = {}
 
+-- Docs questions must not turn into a workspace search: "list the C standard
+-- library headers" once got an LS of the repo instead of the reference.
+M.DOCS_LOOKUP = 'For questions about a programming language standard, a standard library, or a third-party ' ..
+    'library, framework or API, consult its documentation (a documentation MCP server such as Context7, or ' ..
+    'WebFetch on the official docs) instead of searching the workspace, unless the user means code in this project.'
+
 -- Per-server cap: the text is resent with every request.
 local MAX_MCP_INSTRUCTIONS = 4000
 
@@ -22,6 +28,7 @@ local CODING = {
     -- smaller tool results are the main lever on token cost.
     'When several tool calls do not depend on each other (reading multiple files, unrelated searches), issue them together in one response instead of one per turn.',
     'For large files, locate the relevant part with Grep first, then Read only that range with offset/limit instead of the whole file; do not re-read content already in the conversation.',
+    M.DOCS_LOOKUP,
     'When you have finished the task, stop and give a short summary of what you did or found.',
 }
 
