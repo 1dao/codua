@@ -24,6 +24,8 @@ end
 function M.run(content_blocks, ctx, on_event)
     local function emit(ev) if on_event then on_event(ev) end end
     local results = {}
+    local guard = ctx and ctx.tool_guard
+    if guard then guard.begin() end
 
     for _, block in ipairs(content_blocks) do
         if block.type == 'tool_use' then
@@ -32,7 +34,10 @@ function M.run(content_blocks, ctx, on_event)
 
             local tool = registry.find(block.name)
             local res
-            if type(input) == 'table' and input._error ~= nil and input._raw ~= nil then
+            local blocked = guard and guard.check(block.name)
+            if blocked then
+                res = { content = blocked, is_error = true }
+            elseif type(input) == 'table' and input._error ~= nil and input._raw ~= nil then
                 -- The streamed tool arguments did not arrive as valid JSON, so we
                 -- never got real fields. Surface the actual parse error (with the
                 -- byte position) so the model can fix its arguments — NOT a
@@ -66,6 +71,7 @@ function M.run(content_blocks, ctx, on_event)
                 res.content = text.valid_utf8(res.content)
             end
 
+            if guard and not blocked then guard.finish(block.name) end
             emit({ type = 'tool_result', id = block.id, name = block.name, result = res })
 
             -- Conditional skills: a touched file may promote a paths-gated skill

@@ -329,6 +329,27 @@ spec.describe('mcp.fetch_tools.build_adapter', function()
     end)
 end)
 
+spec.describe('mcp.client.list_tools', function()
+    local function client_with(pages)
+        local c = require('xagent.mcp.client').new('pg', { type = 'http', url = 'https://example.invalid' })
+        c.status, c.capabilities, c.transport = 'connected', { tools = {} }, {}
+        c.io = { rpc = function(_, _, params) return pages[(params and params.cursor) or 'first'] end }
+        return c
+    end
+
+    spec.it('follows nextCursor across pages', function()
+        local list = client_with({ first = { tools = { { name = 'a' } }, nextCursor = 'p2' },
+            p2 = { tools = { { name = 'b' } } } }):list_tools()
+        spec.equal(#list, 2); spec.equal(list[2].name, 'b')
+    end)
+
+    spec.it('rejects a repeated cursor instead of looping', function()
+        local list, err = client_with({ first = { tools = {}, nextCursor = 'p2' },
+            p2 = { tools = {}, nextCursor = 'p2' } }):list_tools()
+        spec.equal(list, nil); spec.contains(err, 'repeated')
+    end)
+end)
+
 spec.describe('mcp.registry', function()
     spec.it('stores and filters by status', function()
         mcp_reg.clear()

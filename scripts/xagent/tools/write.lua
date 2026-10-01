@@ -1,12 +1,14 @@
 -- xagent/tools/write.lua — the Write tool. Creates or overwrites a file.
 
 local path = dofile('scripts/core/share/xpath.lua')
+local fs = dofile('scripts/core/share/xfs.lua')
+local xutils = require('xutils')
 
 return {
     name = 'Write',
     description =
         'Write content to a file, creating it or overwriting it entirely. The ' ..
-        'parent directory must already exist. Prefer Edit for changing part of an ' ..
+        'parent directories are created automatically. Prefer Edit for changing part of an ' ..
         'existing file.',
     input_schema = {
         type = 'object',
@@ -27,13 +29,9 @@ return {
             return { content = 'Error: content is required', is_error = true }
         end
         local resolved = path.resolve(fp, ctx and ctx.cwd)
-
-        local f, err = io.open(resolved, 'wb')
-        if not f then
-            return { content = 'Error: cannot open ' .. resolved .. ' for writing: ' .. tostring(err), is_error = true }
-        end
-        f:write(input.content)
-        f:close()
+        local ok, err = xutils.mkdir_p(path.dirname(resolved))
+        if ok then ok, err = fs.write_file(resolved, input.content) end
+        if not ok then return { content = 'Error: cannot write ' .. resolved .. ': ' .. tostring(err), is_error = true } end
         return { content = string.format('Wrote %s (%d bytes)', resolved, #input.content) }
     end,
 }

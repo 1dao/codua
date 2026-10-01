@@ -287,6 +287,74 @@ spec.describe('Read tool', function()
     end)
 end)
 
+spec.describe('file tools without a shell', function()
+    local utils = require('xutils')
+    local root = ((os.getenv('TEMP') or os.getenv('TMPDIR') or '.'):gsub('\\', '/')) .. '/xagent_file_ops_spec'
+    utils.rmtree(root); assert(utils.mkdir_p(root))
+    local ctx = { cwd = root }
+    local by = {}
+    for _, t in ipairs(require('xagent.tools.file_ops').tools()) do by[t.name] = t end
+    local function call(name, input) return by[name].call(input, ctx) end
+
+    spec.it('Write creates missing parent directories', function()
+        local r = require('xagent.tools.write').call({ file_path = 'a/b/note.txt', content = '你好' }, ctx)
+        spec.truthy(not r.is_error, r.content)
+        local f = assert(io.open(root .. '/a/b/note.txt', 'rb')); spec.equal(f:read('a'), '你好'); f:close()
+    end)
+
+    spec.it('FileInfo reports type and size, and missing paths', function()
+        local info = utils.json_unpack(call('FileInfo', { path = 'a/b/note.txt' }).content)
+        spec.equal(info.type, 'file'); spec.equal(info.size, 6)
+        spec.equal(utils.json_unpack(call('FileInfo', { path = 'nope' }).content).exists, false)
+        spec.truthy(by.FileInfo.is_read_only() and not by.CopyFile.is_read_only())
+    end)
+
+    spec.it('copies and moves without overwriting', function()
+        spec.truthy(not call('CopyFile', { source = 'a/b/note.txt', destination = 'c/copy.txt' }).is_error)
+        local r = call('CopyFile', { source = 'a/b/note.txt', destination = 'c/copy.txt' })
+        spec.truthy(r.is_error); spec.contains(r.content, 'Destination exists')
+        spec.truthy(not call('MovePath', { source = 'c/copy.txt', destination = 'd/moved.txt' }).is_error)
+        spec.equal(utils.json_unpack(call('FileInfo', { path = 'c/copy.txt' }).content).exists, false)
+        r = call('MovePath', { source = 'a', destination = 'a/inner' })
+        spec.truthy(r.is_error); spec.contains(r.content, 'into itself')
+    end)
+
+    spec.it('guards parent traversal, the root and non-recursive tree deletes', function()
+        spec.contains(call('FileInfo', { path = '../x' }).content, 'Parent traversal')
+        spec.contains(call('DeletePath', { path = '.' }).content, 'workspace root')
+        spec.truthy(call('DeletePath', { path = 'a' }).is_error)
+        spec.truthy(not call('DeletePath', { path = 'a', recursive = true }).is_error)
+        spec.equal(utils.json_unpack(call('FileInfo', { path = 'a' }).content).exists, false)
+        spec.truthy(not call('MakeDirectory', { path = 'e/f' }).is_error)
+        spec.equal(utils.json_unpack(call('FileInfo', { path = 'e/f' }).content).type, 'directory')
+        utils.rmtree(root)
+    end)
+end)
+
+spec.describe('tools_run tool_guard', function()
+    local tools_run = require('xagent.core.tools_run')
+    local registry = require('xagent.tools.registry')
+    local calls = 0
+    registry.register({ name = 'GuardProbe', input_schema = { type = 'object' },
+        is_read_only = function() return true end,
+        call = function() calls = calls + 1; return { content = 'ran' } end })
+
+    spec.it('blocks a call with an error result and reports finished ones', function()
+        local seen = {}
+        local guard = { begin = function() seen[#seen + 1] = 'begin' end,
+            check = function(name) if calls > 0 then return 'blocked: ' .. name end end,
+            finish = function(name) seen[#seen + 1] = 'finish ' .. name end }
+        local blocks = { { type = 'tool_use', id = '1', name = 'GuardProbe', input = {} },
+            { type = 'tool_use', id = '2', name = 'GuardProbe', input = {} } }
+        local results = tools_run.run(blocks, { tool_guard = guard })
+        spec.equal(calls, 1)
+        spec.equal(results[1].content, 'ran')
+        spec.equal(results[2].is_error, true); spec.equal(results[2].content, 'blocked: GuardProbe')
+        spec.equal(table.concat(seen, ','), 'begin,finish GuardProbe')
+        registry.unregister('GuardProbe')
+    end)
+end)
+
 return {
     __init = function()
         local failed = spec.finish()

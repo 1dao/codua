@@ -44,6 +44,7 @@ registry.register(require('xagent.tools.web_fetch'))
 registry.register(require('xagent.tools.memory_write'))
 registry.register(require('xagent.tools.todo_write').tool)
 registry.register(require('xagent.tools.skill'))
+for _, tool in ipairs(require('xagent.tools.file_ops').tools()) do registry.register(tool) end
 
 local skills    = require('xagent.skills')
 local open_url  = require('xagent.ui.open_url')

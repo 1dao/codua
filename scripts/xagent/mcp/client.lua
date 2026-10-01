@@ -117,9 +117,17 @@ end
 -- or (nil, err) on failure.
 function Client:list_tools()
     if not (self.capabilities and self.capabilities.tools) then return {} end
-    local result, err = self:request('tools/list', {})
-    if not result then return nil, err end
-    return result.tools or {}
+    local list, cursor, seen = {}, nil, {}
+    for _ = 1, 100 do
+        local result, err = self:request('tools/list', cursor and { cursor = cursor } or {})
+        if not result then return nil, err end
+        for _, tool in ipairs(result.tools or {}) do list[#list + 1] = tool end
+        cursor = result.nextCursor
+        if cursor == nil then return list end
+        if type(cursor) ~= 'string' or seen[cursor] then return nil, 'Invalid/repeated tools pagination cursor' end
+        seen[cursor] = true
+    end
+    return nil, 'Too many tools pages'
 end
 
 -- tools/call. Returns (result, err); result = { content = {...}, isError? }.
