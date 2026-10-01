@@ -2337,7 +2337,8 @@ end
 -- ⋮ lists the right-panel pages. (The model picker lives in the composer.)
 
 -- What the header calls the active tab's conversation: its saved/renamed
--- title, else its first user message, else 新会话.
+-- title, else its first user message, else nil (a fresh session shows no
+-- title — a "new session" placeholder said nothing the empty transcript doesn't).
 local function tab_title(tab)
     local t = tab.sess and tab.sess.title
     if not t or t == '' then
@@ -2345,7 +2346,7 @@ local function tab_title(tab)
             if e.role == 'user' then t = e.text; break end
         end
     end
-    return (t and t ~= '') and t or '新会话'
+    return (t and t ~= '') and t or nil
 end
 
 local function dir_name(d)
@@ -2367,10 +2368,14 @@ local function draw_header(W, tab)
     local lc = S.sidebar and accent_col() or txt
     for k = 0, 2 do raygui.draw_rectangle(15, 12 + k * 6, 16, 2, lc[1], lc[2], lc[3], 255) end
 
-    -- session title
-    local title = fit_label(tab_title(tab), math.max(80, math.floor(W * 0.32)))
-    draw_text_col(title, 52, 11, FONT_SIZE, txt)
-    local x = 52 + raygui.measure_text(title) + 12
+    -- session title (none yet for a fresh session)
+    local x = 50
+    local t = tab_title(tab)
+    if t then
+        local title = fit_label(t, math.max(80, math.floor(W * 0.32)))
+        draw_text_col(title, 52, 11, FONT_SIZE, txt)
+        x = 52 + raygui.measure_text(title) + 12
+    end
 
     -- workspace chip: a tinted pill that darkens on hover; click = pick a directory
     local chip_bg = shift(bg, (luma(bg) < 128) and 16 or -12)
