@@ -72,6 +72,70 @@ spec.describe('ChatGPT authentication',function()
         end)
         spec.equal(ok,false);spec.equal(writes,0)
     end)
+    local function login(email,acct)
+        local url=auth.begin();local q=httpcodec.parse_query(url:match('%?(.*)'))
+        local jwt='e30.'..json.base64url_encode(json.json_pack({email=email,chatgpt_account_id=acct}))..'.test'
+        return auth.finish({state=q.state,code='c'},function()
+            return token({access_token='access-'..email,refresh_token='refresh-'..email,id_token=jwt,expires_in=3600})
+        end)
+    end
+    spec.it('keeps several accounts and selects them by key',function()
+        reset({access_token='legacy',refresh_token='r',account_id='old',email='old@example.invalid',expires_at=os.time()+3600})
+        local legacy=auth.account().key
+        local a=login('a@example.invalid','acct-a');local b=login('b@example.invalid','acct-b')
+        spec.equal(#auth.accounts(),3);spec.equal(auth.account().key,legacy)
+        spec.equal(auth.ensure(nil,nil,nil,a.key).access_token,'access-a@example.invalid')
+        spec.equal(auth.ensure(nil,nil,nil,b.key).access_token,'access-b@example.invalid')
+        spec.equal(saved.accounts[legacy].access_token,'legacy')
+        local again=login('a@example.invalid','acct-a');spec.equal(again.key,a.key);spec.equal(#auth.accounts(),3)
+        auth.logout(legacy);spec.equal(auth.account(legacy),nil);spec.equal(#auth.accounts(),2)
+        spec.equal(auth.account()~=nil,true)
+        spec.equal(pcall(auth.ensure,nil,nil,nil,legacy),false)
+        auth.logout();spec.equal(auth.account(),nil);spec.equal(saved,nil)
+    end)
+    spec.it('refreshes accounts independently',function()
+        reset({default='a',accounts={a={key='a',access_token='a0',refresh_token='ra',expires_at=0},
+            b={key='b',access_token='b0',refresh_token='rb',expires_at=0}}})
+        local calls,ra,rb=0
+        local transport=function(opts) calls=calls+1;coroutine.yield()
+            return token({access_token=opts.body:match('refresh_token=(%w+)')..'-new'}) end
+        local c1=coroutine.create(function() ra=auth.ensure(nil,transport,nil,'a') end)
+        local c2=coroutine.create(function() rb=auth.ensure(nil,transport,nil,'b') end)
+        assert(coroutine.resume(c1));assert(coroutine.resume(c2));spec.equal(calls,2)
+        assert(coroutine.resume(c1));assert(coroutine.resume(c2))
+        spec.equal(ra.access_token,'ra-new');spec.equal(rb.access_token,'rb-new')
+        spec.equal(saved.accounts.a.access_token,'ra-new');spec.equal(saved.accounts.b.access_token,'rb-new')
+    end)
+    spec.it('refreshes a token the server rejected before it expired',function()
+        reset({default='a',accounts={a={key='a',access_token='a0',refresh_token='ra',expires_at=os.time()+3600}}})
+        local calls=0
+        local transport=function() calls=calls+1;return token({access_token='a1',refresh_token='ra2'}) end
+        spec.equal(auth.ensure(nil,transport,nil,'a','other').access_token,'a0');spec.equal(calls,0)
+        spec.equal(auth.ensure(nil,transport,nil,'a','a0').access_token,'a1');spec.equal(calls,1)
+        spec.equal(auth.ensure(nil,transport,nil,'a','a0').access_token,'a1');spec.equal(calls,1)
+        spec.equal(saved.accounts.a.refresh_token,'ra2')
+    end)
+    spec.it('provider refreshes once and resends after HTTP 401',function()
+        reset({default='a',accounts={a={key='a',access_token='a0',refresh_token='ra',account_id='acct',expires_at=os.time()+3600}}})
+        local responses=require('xagent.llm.responses')
+        local real_stream,real_ensure=responses.stream_message,auth.ensure
+        local sent,refreshes,done,errors={},0,0,{}
+        responses.stream_message=function(cfg,_,cb)
+            sent[#sent+1]=cfg.api_key
+            if cfg.api_key=='a0' or #sent>2 then return cb.on_error('HTTP 401: Encountered invalidated oauth token for user') end
+            cb.on_done({})
+        end
+        auth.ensure=function(p,_,n,k,r) return real_ensure(p,function()
+            refreshes=refreshes+1;return token({access_token='a'..refreshes,refresh_token='r'..refreshes}) end,n,k,r) end
+        local provider=require('xagent.llm.provider')
+        local cfg={auth_type='chatgpt',api_format='responses',chatgpt_account='a'}
+        local cb={on_done=function() done=done+1 end,on_error=function(m) errors[#errors+1]=m end}
+        provider.stream_message(cfg,{},cb)
+        spec.equal(table.concat(sent,','),'a0,a1');spec.equal(done,1);spec.equal(#errors,0)
+        provider.stream_message(cfg,{},cb)
+        spec.equal(table.concat(sent,','),'a0,a1,a1,a2');spec.equal(refreshes,2);spec.equal(#errors,1)
+        responses.stream_message,auth.ensure=real_stream,real_ensure
+    end)
 end)
 local failures=spec.finish()
 return {__init=function() if failures>0 then os.exit(1) end;xthread.stop(0) end}
