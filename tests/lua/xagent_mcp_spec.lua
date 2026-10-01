@@ -363,6 +363,52 @@ spec.describe('mcp.registry', function()
     end)
 end)
 
+spec.describe('mcp instructions → system prompt', function()
+    local system_prompt = require('xagent.context.system_prompt')
+
+    -- connect() over a stubbed transport: only the initialize result matters.
+    local function connect_with(result)
+        local c = require('xagent.mcp.client').new('docs', { type = 'http', url = 'https://example.invalid' })
+        local saved_rpc, saved_notify = http.rpc, http.notify
+        http.rpc = function() return result end
+        http.notify = function() end
+        local ok = c:connect()
+        http.rpc, http.notify = saved_rpc, saved_notify
+        return c, ok
+    end
+
+    spec.it('keeps initialize instructions on the client', function()
+        local c, ok = connect_with({ capabilities = {}, instructions = 'Use this for library docs.' })
+        spec.truthy(ok)
+        spec.equal(c.instructions, 'Use this for library docs.')
+        spec.nil_value((connect_with({ capabilities = {}, instructions = '  ' })).instructions)
+        spec.nil_value((connect_with({ capabilities = {} })).instructions)
+    end)
+
+    spec.it('registry lists instructions of connected servers only', function()
+        mcp_reg.clear()
+        mcp_reg.set('a', { name = 'a', status = 'connected', instructions = 'A says' }, {})
+        mcp_reg.set('b', { name = 'b', status = 'failed', instructions = 'B says' }, {})
+        mcp_reg.set('c', { name = 'c', status = 'connected' }, {})
+        local list = mcp_reg.instructions()
+        spec.equal(#list, 1)
+        spec.equal(list[1].name, 'a'); spec.equal(list[1].text, 'A says')
+        mcp_reg.clear()
+    end)
+
+    spec.it('adds an MCP section to the system prompt, capped per server', function()
+        local sys = system_prompt.build({ cwd = '.', mcp_instructions = {
+            { name = 'context7', text = 'Use this server to fetch current documentation.' },
+            { name = 'big', text = string.rep('x', 5000) },
+        } })
+        spec.contains(sys, '# MCP Server Instructions')
+        spec.contains(sys, '## context7\nUse this server to fetch current documentation.')
+        spec.contains(sys, '...[truncated]')
+        spec.truthy(not sys:find(string.rep('x', 4001), 1, true), 'capped at 4000 bytes')
+        spec.equal(system_prompt.build({ cwd = '.' }):find('MCP Server Instructions', 1, true), nil)
+    end)
+end)
+
 return {
     __tick_ms = 1000,
     __thread_handle = function() end,

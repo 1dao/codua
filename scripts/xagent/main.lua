@@ -162,7 +162,8 @@ local function __init()
         end
 
         local ctx = { cwd = cwd }
-        local sys = system_prompt.build({ cwd = cwd })
+        local sys = system_prompt.build({ cwd = cwd,
+            mcp_instructions = require('xagent.mcp.registry').instructions() })
         local rem = skills.reminder()
         if rem ~= '' then sys = sys .. '\n\n' .. rem end
         local messages = { { role = 'user', content = prompt } }

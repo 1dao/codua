@@ -36,6 +36,7 @@ function M.new(name, config)
         error = nil,
         capabilities = nil,
         server_info = nil,
+        instructions = nil,      -- initialize result.instructions, if any
         transport = nil,
     }, Client)
 end
@@ -89,6 +90,11 @@ function Client:connect()
 
     self.capabilities = (type(result.capabilities) == 'table') and result.capabilities or {}
     self.server_info = result.serverInfo
+    -- The server's own guidance on when to use its tools (Context7: "use this
+    -- whenever the user asks about a library..."). Tool descriptions alone do
+    -- not say when to reach for a docs server, so it goes into the system prompt.
+    local instr = result.instructions
+    self.instructions = (type(instr) == 'string' and instr:match('%S')) and instr or nil
     self.transport.protocol_version = result.protocolVersion or CLIENT_PROTOCOL_VERSION
 
     -- Tell the server we're ready. Best-effort: a notify failure here doesn't

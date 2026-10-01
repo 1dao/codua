@@ -2,7 +2,12 @@
 -- M1 slice: identity + concise coding instructions + environment. Memory
 -- (AGENT.md / CLAUDE.md), skills, agents, etc. are added in later milestones.
 
+local text = dofile('scripts/core/share/xtext.lua')
+
 local M = {}
+
+-- Per-server cap: the text is resent with every request.
+local MAX_MCP_INSTRUCTIONS = 4000
 
 local IDENTITY = {
     'You are xagent, a terminal-native local coding assistant running inside the user\'s workspace.',
@@ -30,7 +35,23 @@ local function env_section(opts)
     return table.concat(lines, '\n')
 end
 
--- opts: { cwd, os?, project_md? }
+-- The usage instructions MCP servers sent at initialize (mcp/registry
+-- .instructions()) as one section, laid out the way Claude Code does; '' when
+-- there are none. Tool descriptions say what a tool does, these say when to
+-- use it — without them a docs server is never chosen over a workspace search.
+function M.mcp_section(list)
+    if type(list) ~= 'table' or #list == 0 then return '' end
+    local parts = { '# MCP Server Instructions\n\n' ..
+        'The following MCP servers have provided instructions for how to use their tools and resources:' }
+    for _, it in ipairs(list) do
+        local body = tostring(it.text or '')
+        if #body > MAX_MCP_INSTRUCTIONS then body = body:sub(1, MAX_MCP_INSTRUCTIONS) .. '\n...[truncated]' end
+        parts[#parts + 1] = '## ' .. tostring(it.name) .. '\n' .. body
+    end
+    return text.valid_utf8(table.concat(parts, '\n\n'))
+end
+
+-- opts: { cwd, os?, project_md?, mcp_instructions? }
 function M.build(opts)
     opts = opts or {}
     local parts = {}
@@ -40,6 +61,8 @@ function M.build(opts)
     if opts.project_md and opts.project_md ~= '' then
         parts[#parts + 1] = 'Project memory (from AGENT.md / CLAUDE.md — follow it):\n' .. opts.project_md
     end
+    local mcp = M.mcp_section(opts.mcp_instructions)
+    if mcp ~= '' then parts[#parts + 1] = mcp end
     return table.concat(parts, '\n\n')
 end
 

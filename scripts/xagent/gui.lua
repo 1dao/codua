@@ -482,6 +482,13 @@ end
 -- entries are listed but stay hand-edited. Every change reconnects all servers.
 local mcp_config = require('xagent.mcp.config')
 
+-- The system prompt for a session in `cwd`: project memory plus the usage
+-- instructions of whichever MCP servers are connected right now.
+local function build_system(cwd)
+    return system_prompt.build({ cwd = cwd, project_md = project_md.load(cwd),
+        mcp_instructions = mcp_registry.instructions() })
+end
+
 -- Connect (or reconnect) every configured server. Runs inside a coroutine.
 local function mcp_connect(reloading)
     S.mcp_status = 'connecting'
@@ -490,7 +497,12 @@ local function mcp_connect(reloading)
     S.mcp_status = 'ready'
     local params = registry.to_api_params()
     for _, tab in ipairs(S.tabs) do
-        if tab.sess then tab.sess.tools = params end
+        -- Tabs open before the servers connect; their prompt gains the
+        -- servers' instructions here, together with the tools.
+        if tab.sess then
+            tab.sess.tools = params
+            tab.sess.system = build_system(tab.sess.cwd or tab.cwd)
+        end
     end
     if reloading then
         add(T(), 'system', string.format('✓ MCP 已重新加载：%d 个服务器已连接，共 %d 个工具',
@@ -1111,7 +1123,7 @@ local function load_history_item(it)
     if not s2 then tab.status = 'load failed'; return end
     if tab.sess then tab.sess.cancelled = true end   -- stop a still-running turn at its next boundary
     s2.tools = registry.to_api_params()
-    s2.system = system_prompt.build({ cwd = s2.cwd, project_md = project_md.load(s2.cwd) })
+    s2.system = build_system(s2.cwd)
     s2.max_tokens = MAX_TOKENS
     s2.confirm = make_confirm(tab, s2)
     tab.sess = s2
@@ -1159,7 +1171,7 @@ function new_session()
     local cwd = tab.cwd or (tab.sess and tab.sess.cwd) or '.'
     tab.sess = session.new({
         cfg = tab.cfg, cwd = cwd, tools = registry.to_api_params(),
-        system = system_prompt.build({ cwd = cwd, project_md = project_md.load(cwd) }),
+        system = build_system(cwd),
         max_tokens = MAX_TOKENS,
     })
     tab.sess.confirm = make_confirm(tab, tab.sess)
@@ -1197,7 +1209,7 @@ function new_tab(cfg, cwd)
     skills.bootstrap(cwd)   -- align the (global) project skills with this tab's dir
     tab.sess = session.new({
         cfg = cfg, cwd = cwd, tools = registry.to_api_params(),
-        system = system_prompt.build({ cwd = cwd, project_md = project_md.load(cwd) }),
+        system = build_system(cwd),
         max_tokens = MAX_TOKENS,
     })
     tab.sess.confirm = make_confirm(tab, tab.sess)

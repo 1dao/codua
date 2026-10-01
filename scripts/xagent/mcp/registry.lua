@@ -45,6 +45,18 @@ function M.connected()
     return list
 end
 
+-- Usage instructions of the connected servers that sent any, in registration
+-- order: { { name = <server>, text = <instructions> }, ... }.
+function M.instructions()
+    local list = {}
+    for _, c in ipairs(M.connected()) do
+        if type(c.instructions) == 'string' and c.instructions ~= '' then
+            list[#list + 1] = { name = c.name, text = c.instructions }
+        end
+    end
+    return list
+end
+
 function M.clear()
     entries = {}
     order = {}
