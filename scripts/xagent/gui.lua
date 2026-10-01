@@ -2441,18 +2441,36 @@ end
 -- directory, each row showing its title over a muted "time · message count"
 -- line (near-identical titles are otherwise impossible to tell apart).
 local function draw_history_sidebar(x0, H, tab)
-    raygui.label(x0 + 10, TOP + 6, SIDEBAR_W - 90, 22, '历史会话')
-    if raygui.button(x0 + SIDEBAR_W - 78, TOP + 4, 70, 26, '新会话') then new_session() end
-
-    local fw = SIDEBAR_W - 16 - 96
-    S.history_query, S.history_query_edit = raygui.textbox(x0 + 8, TOP + 36, fw, 28,
+    -- one header row: 历史会话 · [search…] · fold icon
+    local lw = raygui.measure_text('历史会话') + 12
+    draw_text_col('历史会话', x0 + 10, TOP + 9, FONT_SIZE, text_col())
+    local fold_w = 28
+    local fx = x0 + 10 + lw
+    local fw = SIDEBAR_W - (fx - x0) - fold_w - 14
+    S.history_query, S.history_query_edit = raygui.textbox(fx, TOP + 4, fw, 26,
         S.history_query, S.history_query_edit)
     if S.history_query == '' and not S.history_query_edit then
-        draw_text_col('搜索标题…', x0 + 16, TOP + 42, FONT_SIZE, muted_col())
+        draw_text_col('搜索…', fx + 8, TOP + 9, FONT_SIZE, muted_col())
     end
-    if raygui.button(x0 + 8 + fw + 6, TOP + 36, 90, 28, S.history_cwd_only and '仅当前目录' or '全部目录') then
+
+    -- fold icon: ⊟ while every directory is listed (click: collapse to the
+    -- current directory), ⊞ while collapsed (click: show all again)
+    local bx = x0 + SIDEBAR_W - 8 - fold_w
+    if flat_button(bx, TOP + 4, fold_w, 26, '', S.sidebar_bg) then
         S.history_cwd_only = not S.history_cwd_only
         S.history_scroll = 0
+    end
+    do
+        local c = S.history_cwd_only and accent_col() or text_col()
+        local n, ix, iy = 11, bx + math.floor((fold_w - 11) / 2), TOP + 4 + math.floor((26 - 11) / 2)
+        raygui.draw_rectangle(ix, iy, n, 1, c[1], c[2], c[3], 255)
+        raygui.draw_rectangle(ix, iy + n - 1, n, 1, c[1], c[2], c[3], 255)
+        raygui.draw_rectangle(ix, iy, 1, n, c[1], c[2], c[3], 255)
+        raygui.draw_rectangle(ix + n - 1, iy, 1, n, c[1], c[2], c[3], 255)
+        raygui.draw_rectangle(ix + 3, iy + 5, 5, 1, c[1], c[2], c[3], 255)             -- minus
+        if S.history_cwd_only then
+            raygui.draw_rectangle(ix + 5, iy + 3, 1, 5, c[1], c[2], c[3], 255)         -- plus
+        end
     end
 
     -- filter, then group by working directory (first appearance ≈ recency)
@@ -2482,7 +2500,7 @@ local function draw_history_sidebar(x0, H, tab)
         for _, it in ipairs(g.items) do rows[#rows + 1] = { item = it, y = y, h = ITEM_H }; y = y + ITEM_H end
     end
 
-    local list_top = TOP + 72
+    local list_top = TOP + 38
     local view_h = H - list_top - 8
     local over_list, wheel, mx, my = scroll_list('history_scroll', x0, list_top, view_h, y, ITEM_H)
     if wheel ~= 0 then S.menu_item = nil end
