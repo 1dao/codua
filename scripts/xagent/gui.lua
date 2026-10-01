@@ -243,6 +243,37 @@ local function draw_caret(cx, cy, col, up)
     end
 end
 
+-- Borderless button: its background matches `bg` until hovered / pressed,
+-- when it takes a slightly shifted tint — the toolbar look of the header and
+-- the composer row. raygui has no such style, so the BUTTON colors are swapped
+-- in for this one call and restored after; raygui still owns click and lock
+-- handling (modals freeze it like any other control).
+local FLAT_PROPS
+local function pack_color(c)
+    return (c[1] << 24) | (c[2] << 16) | (c[3] << 8) | (c[4] or 255)
+end
+local function flat_button(x, y, w, h, label, bg, hover_bg)
+    bg = bg or S.view_bg or { 240, 240, 240, 255 }
+    local B = raygui.BUTTON
+    FLAT_PROPS = FLAT_PROPS or {
+        raygui.BORDER_WIDTH,
+        raygui.BASE_COLOR_NORMAL, raygui.BORDER_COLOR_NORMAL,
+        raygui.BASE_COLOR_FOCUSED, raygui.BORDER_COLOR_FOCUSED,
+        raygui.BASE_COLOR_PRESSED, raygui.BORDER_COLOR_PRESSED,
+    }
+    local saved = {}
+    for i, prop in ipairs(FLAT_PROPS) do saved[i] = raygui.get_style(B, prop) end
+    local d = (luma(bg) < 128) and 1 or -1        -- lighten on dark themes, darken on light
+    local base = pack_color(bg)
+    local hover, press = pack_color(shift(bg, 14 * d)), pack_color(shift(bg, 26 * d))
+    if hover_bg then hover, press = pack_color(hover_bg), pack_color(shift(hover_bg, -20)) end
+    local vals = { 0, base, base, hover, hover, press, press }
+    for i, prop in ipairs(FLAT_PROPS) do raygui.set_style(B, prop, vals[i]) end
+    local clicked = raygui.button(x, y, w, h, label)
+    for i, prop in ipairs(FLAT_PROPS) do raygui.set_style(B, prop, saved[i]) end
+    return clicked
+end
+
 -- ── working-directory helpers (history grouping + the editable current dir) ──
 -- Normalized key so "C:\a\b", "c:/a/b/" group together on Windows.
 local function dir_key(d)
@@ -1404,8 +1435,11 @@ end
 -- tab, so the caller re-reads T() afterwards.
 local function draw_tabbar(W)
     local y = HEADER_H
-    local sb = S.sidebar_bg
-    raygui.draw_rectangle(0, y, W, TABBAR_H, sb[1], sb[2], sb[3], sb[4])
+    local bg = S.view_bg or { 240, 240, 240, 255 }
+    raygui.draw_rectangle(0, y, W, TABBAR_H, bg[1], bg[2], bg[3], 255)
+    local tc = (markdown.palette and markdown.palette.text) or { 60, 60, 60, 255 }
+    local line = mix(bg, tc, 0.12)                    -- hairline under the strip
+    raygui.draw_rectangle(0, y + TABBAR_H - 1, W, 1, line[1], line[2], line[3], 255)
 
     local n = #S.tabs
     local plus_w = 30
@@ -1426,8 +1460,8 @@ local function draw_tabbar(W)
         end
         local over = my >= ry and my < ry + rh and mx >= x and mx < x + tw
         local closable = (n > 1 and over)            -- show the close affordance on hover
-        local clicked = raygui.button(x, ry, tw, rh, (active and '● ' or '   ') .. sanitize_label(label))
-        if active then raygui.draw_rectangle(x, ry + rh - 2, tw, 2, ac[1], ac[2], ac[3], 255) end
+        local clicked = flat_button(x, ry, tw, rh, '  ' .. sanitize_label(label))
+        if active then raygui.draw_rectangle(x + 6, ry + rh - 1, tw - 12, 2, ac[1], ac[2], ac[3], 255) end
         -- The close 'x' is a FRAMELESS icon drawn over the tab's right edge (a
         -- nested button would draw a second border inside the tab and look
         -- misaligned). The single tab button handles the click: over the icon →
@@ -1449,10 +1483,10 @@ local function draw_tabbar(W)
 
     -- the right panel's close button sits in this row, above the panel itself
     -- (inside the panel it would collide with each page's own header buttons)
-    if S.panel and raygui.button(W - 102, ry, 96, rh, '#113# 关闭') then S.panel = nil end
+    if S.panel and flat_button(W - 102, ry, 96, rh, '#113# 关闭') then S.panel = nil end
 
     S.plus_x = x
-    if raygui.button(x, ry, plus_w, rh, '+') then
+    if flat_button(x, ry, plus_w, rh, '+') then
         if S.profiles and #S.profiles > 1 then
             S.tab_picker = not S.tab_picker
         else
@@ -1548,6 +1582,16 @@ local function dropdown_button(id, x, y, w, h, current)
     if S.dd_open == id then S.dd_anchor = { x = x, y = y, w = w, h = h } end
 end
 
+-- Flat variant of dropdown_button (no frame until hovered), for toolbars.
+local function flat_dropdown(id, x, y, w, h, current)
+    local open = (S.dd_open == id)
+    local clicked = flat_button(x, y, w, h, '  ' .. sanitize_label(current or '（无）'))
+    local col = (markdown.palette and markdown.palette.text) or { 200, 200, 200, 255 }
+    draw_caret(x + w - 12, y + h / 2, col, open)
+    if clicked then S.dd_open = open and nil or id end
+    if S.dd_open == id then S.dd_anchor = { x = x, y = y, w = w, h = h } end
+end
+
 -- Draw the open dropdown's list (theme or model) over the rest of the UI.
 -- `was_open` is S.dd_open as of frame start (before any control could toggle it),
 -- so the click that OPENS the dropdown this frame isn't read as an outside-click.
@@ -1585,17 +1629,18 @@ local function draw_dropdown_overlays(was_open)
     local a = S.dd_anchor
     local row_h = FONT_SIZE + 10
     local px, pw, py = a.x, math.max(a.w, 240), a.y + a.h + 2
-    local sw = raygui.screen_size()
-    if px + pw > sw - 4 then px = math.max(4, sw - 4 - pw) end   -- the ⋮ menu sits at the right edge
     local ph = 6 + #items * row_h
+    local sw, sh = raygui.screen_size()
+    if px + pw > sw - 4 then px = math.max(4, sw - 4 - pw) end   -- the ⋮ menu sits at the right edge
+    if py + ph > sh - 4 then py = math.max(4, a.y - ph - 2) end  -- the composer's picker: open upward
     local pb = S.sidebar_bg
     raygui.draw_rectangle(px, py, pw, ph, pb[1], pb[2], pb[3], 252)
     local ac = (markdown.palette and markdown.palette.heading) or { 110, 170, 120, 255 }
     raygui.draw_rectangle(px, py, 3, ph, ac[1], ac[2], ac[3], 255)
     for i, it in ipairs(items) do
         local ry = py + 3 + (i - 1) * row_h
-        if raygui.button(px + 4, ry, pw - 8, row_h - 3,
-                (it.cur and '● ' or '   ') .. sanitize_label(it.label)) then
+        if flat_button(px + 4, ry, pw - 8, row_h - 3,
+                (it.cur and '● ' or '   ') .. sanitize_label(it.label), pb) then
             if S.dd_open == 'theme' then apply_theme(it.label)
             elseif S.dd_open == 'model' then S.model_sel = i
             elseif S.dd_open == 'menu' then toggle_panel(it.mode)
@@ -2164,57 +2209,226 @@ local function stop_turn(tab)
     tab.status = '停止中'
 end
 
--- ── top bar ─────────────────────────────────────────────────────────────────
--- [≡] [model ▾] [workspace] status · this turn's usage ...... 12.3k tok [meter] [⋮]
--- ≡ toggles the projects/sessions sidebar; ⋮ lists the right-panel pages. The
--- model and workspace are buttons: switching them is a click away.
-local function draw_header(W, tab)
-    local hb = S.header_bg
-    raygui.draw_rectangle(0, 0, W, HEADER_H, hb[1], hb[2], hb[3], hb[4])
+-- ── frameless window chrome ─────────────────────────────────────────────────
+-- The window has no OS title bar (init { undecorated = true }), like Claude's
+-- desktop app: the header carries minimize / maximize / close right of ⋮, a
+-- press on empty header space moves the window (double-click maximizes), and
+-- a thin band along the border resizes it. With a raygui build that lacks the
+-- window functions, S.frameless stays false and the OS frame is kept.
+local WINBTN_W = 46                 -- width of each of the three window buttons
+local EDGE = 5                      -- resize band along the window border
+local MIN_W, MIN_H = 480, 360
+local EDGE_CURSOR = { n = 6, s = 6, e = 5, w = 5, nw = 7, se = 7, ne = 8, sw = 8 }
 
-    -- ≡: three bars over an empty button (the font's ☰ isn't reliable at this size)
-    if raygui.button(6, 5, 34, 28, '') then toggle_sidebar() end
-    local lc = S.sidebar and accent_col() or text_col()
+local function toggle_maximize()
+    if raygui.is_window_maximized() then raygui.restore_window() else raygui.maximize_window() end
+end
+
+local function set_cursor(n)
+    if S.win_cursor ~= n then S.win_cursor = n; raygui.set_mouse_cursor(n) end
+end
+
+-- Which border band the pointer is on: '', or a combination of n/s + e/w.
+local function edge_at(mx, my, W, H)
+    local e = ''
+    if my < EDGE then e = 'n' elseif my >= H - EDGE then e = 's' end
+    if mx < EDGE then e = e .. 'w' elseif mx >= W - EDGE then e = e .. 'e' end
+    return e
+end
+
+-- True if (mx, my) is on a header control (recorded by draw_header last frame);
+-- everything else in the header is a drag handle.
+local function over_header_control(mx, my)
+    for _, r in ipairs(S.hdr_hits or {}) do
+        if mx >= r[1] and mx < r[1] + r[3] and my >= r[2] and my < r[2] + r[4] then return true end
+    end
+    return false
+end
+
+-- Runs at the start of each frame, from the raw mouse state. Returns true while
+-- a move/resize is in progress (the caller freezes the rest of the UI). Moves
+-- follow the pointer in SCREEN coordinates (mouse_screen), not window-relative
+-- ones, which lag a frame behind each move and make the window jitter.
+local function window_chrome(W, H)
+    local down = raygui.mouse_down()
+    local press = down and not S.win_prev_down
+    S.win_prev_down = down
+    local g = S.win_grab
+    if g then
+        if not down then S.win_grab = nil; return false end
+        local sx, sy = raygui.mouse_screen()
+        local dx, dy = sx - g.sx, sy - g.sy
+        if g.mode == 'move' then
+            raygui.set_window_pos(g.wx + dx, g.wy + dy)
+        else
+            local x, y, w, h = g.wx, g.wy, g.ww, g.wh
+            if g.mode:find('e') then w = math.max(MIN_W, g.ww + dx) end
+            if g.mode:find('s') then h = math.max(MIN_H, g.wh + dy) end
+            if g.mode:find('w') then w = math.max(MIN_W, g.ww - dx); x = g.wx + g.ww - w end
+            if g.mode:find('n') then h = math.max(MIN_H, g.wh - dy); y = g.wy + g.wh - h end
+            raygui.set_window_size(w, h)
+            if x ~= g.wx or y ~= g.wy then raygui.set_window_pos(x, y) end
+        end
+        return true
+    end
+
+    local mx, my = raygui.get_mouse()
+    local maximized = raygui.is_window_maximized()
+    local edge = maximized and '' or edge_at(mx, my, W, H)
+    set_cursor(EDGE_CURSOR[edge] or 0)
+    if not press then return false end
+
+    local function grab(mode)
+        local sx, sy = raygui.mouse_screen()
+        local wx, wy = raygui.window_pos()
+        S.win_grab = { mode = mode, sx = sx, sy = sy, wx = wx, wy = wy, ww = W, wh = H }
+    end
+    if edge ~= '' then
+        grab(edge); return true
+    end
+    if my < HEADER_H and not over_header_control(mx, my) then
+        if S.win_last_press and S.frame - S.win_last_press < 25 then   -- ~0.4 s at 60 fps
+            S.win_last_press = nil
+            toggle_maximize()
+            return true
+        end
+        S.win_last_press = S.frame
+        if not maximized then grab('move'); return true end   -- a maximized window stays put
+    end
+    return false
+end
+
+-- minimize / maximize-restore / close, hand-drawn icons over flat buttons
+local function draw_window_controls(W)
+    local txt = text_col()
+    local x = W - 3 * WINBTN_W
+    local cy = math.floor(HEADER_H / 2)
+    if flat_button(x, 0, WINBTN_W, HEADER_H, '') then raygui.minimize_window() end
+    raygui.draw_rectangle(x + 18, cy, 10, 1, txt[1], txt[2], txt[3], 255)
+
+    x = x + WINBTN_W
+    if flat_button(x, 0, WINBTN_W, HEADER_H, '') then toggle_maximize() end
+    local function box(bx, by, n)
+        raygui.draw_rectangle(bx, by, n, 1, txt[1], txt[2], txt[3], 255)
+        raygui.draw_rectangle(bx, by + n - 1, n, 1, txt[1], txt[2], txt[3], 255)
+        raygui.draw_rectangle(bx, by, 1, n, txt[1], txt[2], txt[3], 255)
+        raygui.draw_rectangle(bx + n - 1, by, 1, n, txt[1], txt[2], txt[3], 255)
+    end
+    if raygui.is_window_maximized() then        -- restore: two overlapping squares
+        box(x + 20, cy - 6, 8)
+        local bg = S.view_bg or { 240, 240, 240, 255 }
+        raygui.draw_rectangle(x + 18, cy - 4, 8, 8, bg[1], bg[2], bg[3], 255)
+        box(x + 18, cy - 4, 8)
+    else
+        box(x + 18, cy - 5, 10)
+    end
+
+    x = x + WINBTN_W
+    local mx, my = raygui.get_mouse()
+    local over = mx >= x and my >= 0 and my < HEADER_H
+    if flat_button(x, 0, WINBTN_W, HEADER_H, '', nil, { 196, 43, 28, 255 }) then S.quit = true end
+    draw_x(x + 15, 0, 16, HEADER_H, over and { 255, 255, 255, 255 } or txt, 5)
+end
+
+-- ── top bar ─────────────────────────────────────────────────────────────────
+-- [≡]  session title  (workspace)   status · usage ........ 12.3k tok ▬▬▬  [⋮]
+-- Flat, on the content background like the conversation below it: ≡ toggles
+-- the projects/sessions sidebar, the workspace chip picks another directory,
+-- ⋮ lists the right-panel pages. (The model picker lives in the composer.)
+
+-- What the header calls the active tab's conversation: its saved/renamed
+-- title, else its first user message, else 新会话.
+local function tab_title(tab)
+    local t = tab.sess and tab.sess.title
+    if not t or t == '' then
+        for _, e in ipairs(tab.entries) do
+            if e.role == 'user' then t = e.text; break end
+        end
+    end
+    return (t and t ~= '') and t or '新会话'
+end
+
+local function dir_name(d)
+    d = tostring(d or ''):gsub('[\\/]+$', '')
+    return d:match('([^\\/]+)$') or d
+end
+
+local function draw_header(W, tab)
+    local bg = S.view_bg or { 240, 240, 240, 255 }
+    raygui.draw_rectangle(0, 0, W, HEADER_H, bg[1], bg[2], bg[3], 255)
+    local txt, muted = text_col(), muted_col()
+
+    -- header controls; the rest of the bar is the window's drag handle
+    local hits = { { 6, 5, 34, 28 } }
+    S.hdr_hits = hits
+
+    -- ≡: three bars over a flat button (the font's ☰ isn't reliable at this size)
+    if flat_button(6, 5, 34, 28, '') then toggle_sidebar() end
+    local lc = S.sidebar and accent_col() or txt
     for k = 0, 2 do raygui.draw_rectangle(15, 12 + k * 6, 16, 2, lc[1], lc[2], lc[3], 255) end
 
-    local mx0, mw = 46, 190
-    dropdown_button('tabmodel', mx0, 5, mw, 28, tab.cfg and (tab.cfg.name or tab.cfg.model) or '?')
+    -- session title
+    local title = fit_label(tab_title(tab), math.max(80, math.floor(W * 0.32)))
+    draw_text_col(title, 52, 11, FONT_SIZE, txt)
+    local x = 52 + raygui.measure_text(title) + 12
 
-    local wx, ww = mx0 + mw + 6, 200
-    local wlabel = S.picking_dir and '选择中…' or fit_label(dir_tail(tab.cwd), ww - 44)
-    if raygui.button(wx, 5, ww, 28, '#3# ' .. wlabel) then pick_directory() end
+    -- workspace chip: a tinted pill that darkens on hover; click = pick a directory
+    local chip_bg = shift(bg, (luma(bg) < 128) and 16 or -12)
+    local chip = S.picking_dir and '选择中…' or fit_label(dir_name(tab.cwd), 160)
+    local cw = raygui.measure_text(chip) + 22
+    if flat_button(x, 8, cw, 22, chip, chip_bg) then pick_directory() end
+    hits[#hits + 1] = { x, 8, cw, 22 }
+    x = x + cw + 14
 
+    -- right side: [meter] [⋮] [– □ ×]
+    local wbw = S.frameless and (3 * WINBTN_W + 6) or 0
+    local kx = W - 40 - wbw
+    local right = kx - 8
+    local b = tab.budget
+    if b then
+        -- token count + a thin bar filling toward the window. Green normally,
+        -- amber on 'warning', red on 'error'/'blocking' (compaction imminent /
+        -- just happened).
+        local bw, bh = 72, 6
+        local bx, by = right - bw, 16
+        local kt = ktok(b.estimated) .. ' tok'
+        local ktw = raygui.measure_text(kt, 13)
+        draw_text_col(kt, bx - ktw - 8, 12, 13, muted)
+        local pct = math.min(1, b.percent or 0)
+        local fill = { 110, 170, 120, 255 }
+        if b.state == 'warning' then fill = { 210, 175, 70, 255 }
+        elseif b.state ~= 'normal' then fill = { 215, 95, 85, 255 } end
+        local trk = mix(bg, muted, 0.35)
+        raygui.draw_rectangle(bx, by, bw, bh, trk[1], trk[2], trk[3], 255)
+        raygui.draw_rectangle(bx, by, math.floor(bw * pct), bh, fill[1], fill[2], fill[3], 255)
+        right = bx - ktw - 20
+    end
+
+    -- status (+ this turn's usage once it finished), muted, between the two
     local status_text = tab.status
     if tab.busy then   -- thinking dots: . .. ... cycling (~3 steps/second)
         status_text = status_text .. ' ' .. ('.'):rep(1 + math.floor(S.frame / 20) % 3)
     elseif tab.last_usage then
         status_text = status_text .. '  ·  本轮 ' .. usage_label(tab.last_usage)
     end
-    local sx = wx + ww + 12
-    raygui.label(sx, 8, math.max(0, W - sx - 226), 24, status_text)
-
-    -- context-usage meter: token count + a thin bar filling toward the window.
-    -- Green normally, amber on 'warning', red on 'error'/'blocking' (compaction
-    -- imminent / just happened).
-    local b = tab.budget
-    if b then
-        local bw, bx, by, bh = 96, W - 148, 15, 8
-        raygui.label(bx - 72, 8, 68, 24, ktok(b.estimated) .. ' tok')
-        local pct = math.min(1, b.percent or 0)
-        local fill = { 110, 170, 120, 255 }
-        if b.state == 'warning' then fill = { 210, 175, 70, 255 }
-        elseif b.state ~= 'normal' then fill = { 215, 95, 85, 255 } end
-        local trk = mix(S.view_bg or { 40, 40, 40, 255 }, muted_col(), 0.5)
-        raygui.draw_rectangle(bx, by, bw, bh, trk[1], trk[2], trk[3], 255)
-        raygui.draw_rectangle(bx, by, math.floor(bw * pct), bh, fill[1], fill[2], fill[3], 255)
+    if right - x > 40 then
+        draw_text_col(fit_label(status_text, right - x, 13), x, 12, 13, muted)
     end
 
     -- ⋮: the page menu (drawn by draw_dropdown_overlays like the other lists)
-    local kx = W - 40
-    if kebab_button(kx, 5, 34, 28, (S.panel or S.dd_open == 'menu') and accent_col() or text_col()) then
+    local on = S.panel or S.dd_open == 'menu'
+    if flat_button(kx, 5, 34, 28, '') then
         S.dd_open = (S.dd_open ~= 'menu') and 'menu' or nil
     end
+    local dc = on and accent_col() or txt
+    for k = 0, 2 do raygui.draw_rectangle(kx + 16, 12 + k * 6, 3, 3, dc[1], dc[2], dc[3], 255) end
     if S.dd_open == 'menu' then S.dd_anchor = { x = kx, y = 5, w = 34, h = 28 } end
+    hits[#hits + 1] = { kx, 5, 34, 28 }
+
+    if S.frameless then
+        draw_window_controls(W)
+        hits[#hits + 1] = { W - 3 * WINBTN_W, 0, 3 * WINBTN_W, HEADER_H }
+    end
 end
 
 -- ── sidebar pages ───────────────────────────────────────────────────────────
@@ -2506,25 +2720,33 @@ local INPUT_H, TOOLBAR_H = 74, 32
 local function draw_composer_toolbar(tab, x, iy, w)
     local ty = iy + INPUT_H + 4
     local bh = TOOLBAR_H - 4
-    if raygui.button(x, ty, 32, bh, '+') then insert_file_ref('') end   -- '@' → file picker
+    if flat_button(x, ty, 32, bh, '+') then insert_file_ref('') end   -- '@' → file picker
 
     -- permission mode: write = auto-run · ask = confirm each state-changing tool
     local mode_w = 132
     local mode_lbl = (S.mode == 'ask') and '询问 · 写前确认' or '写入 · 自动执行'
-    if raygui.button(x + 38, ty, mode_w, bh, mode_lbl) then
+    if flat_button(x + 38, ty, mode_w, bh, mode_lbl) then
         S.mode = (S.mode == 'ask') and 'write' or 'ask'
         tab.status = (S.mode == 'ask') and '询问模式：写操作前确认' or '写入模式：自动执行'
     end
 
     local send_w = 80
+    local sx = x + w - send_w
+
+    -- model picker (this tab) left of the send button, like a chat app's
+    -- model selector; its list opens upward
+    local mname = sanitize_label(tab.cfg and (tab.cfg.name or tab.cfg.model) or '?')
+    local mw = math.min(200, raygui.measure_text(mname) + 40)
+    local mx = sx - 8 - mw
+    flat_dropdown('tabmodel', mx, ty, mw, bh, mname)
+
     local hx = x + 38 + mode_w + 12
-    local room = (x + w - send_w - 12) - hx
+    local room = (mx - 12) - hx
     if room > 60 then
         draw_text_col(fit_label('Enter 发送 · Ctrl+Enter 换行 · Ctrl+V 贴图', room, 13),
             hx, ty + 8, 13, muted_col())
     end
 
-    local sx = x + w - send_w
     if tab.busy then
         if raygui.button(sx, ty, send_w, bh, '') then stop_turn(tab) end
         raygui.draw_rectangle(sx + 16, ty + math.floor(bh / 2) - 5, 10, 10, 215, 95, 85, 255)
@@ -2541,7 +2763,10 @@ local function __init()
     -- which holds its RPC open for as long as the human takes to answer.
     assert(subprocess.setup({ ui_lane = true }))
 
-    raygui.init(960, 700, 'xagent')
+    -- Borderless (custom title bar in the header) when this raygui build can
+    -- move/resize/minimize the window; otherwise keep the OS frame.
+    S.frameless = (raygui.mouse_screen and raygui.set_window_pos and raygui.minimize_window) and true or false
+    raygui.init(960, 700, 'xagent', { undecorated = S.frameless })
     -- Pre-seed glyphs (eliminates streaming flicker); fall back to ASCII-only.
     if not raygui.load_system_font(FONT_SIZE, preseed_charset()) and
        not raygui.load_font('tools/fonts/NotoSansSC-Regular.otf', FONT_SIZE, preseed_charset()) then
@@ -2623,12 +2848,17 @@ end
 
 local function __update()
     oauth_login.tick()
-    if raygui.should_close() then xthread.stop(0); return end
+    if raygui.should_close() or S.quit then xthread.stop(0); return end
     local tab = T()
     if not tab then return end
 
     local W, H = raygui.screen_size()
     raygui.begin()
+
+    -- frameless window: move/resize from the raw mouse before anything draws;
+    -- while it runs the UI is locked so the drag doesn't also press controls
+    local grabbing = S.frameless and window_chrome(W, H)
+    if grabbing then raygui.lock() end
 
     -- Capture the dropdown's open-state BEFORE any control this frame can toggle
     -- it: the click that OPENS a dropdown must not also be read as the outside-
@@ -2815,6 +3045,7 @@ local function __update()
     -- open dropdown list: topmost overlay; unlocks the background it was drawn over.
     draw_dropdown_overlays(dd_open_at_start)
 
+    if grabbing then raygui.unlock() end
     raygui.finish()
 end
 
