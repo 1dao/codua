@@ -53,8 +53,6 @@ end
 function M.editor(rg, bg, x, y, w, h, value, edit, enter_sends)
     return styled(rg, rg.TEXTBOX, {
         [rg.BORDER_WIDTH] = 0,
-        [rg.BORDER_COLOR_NORMAL] = packed(bg), [rg.BORDER_COLOR_FOCUSED] = packed(bg),
-        [rg.BORDER_COLOR_PRESSED] = packed(bg),
         [rg.BASE_COLOR_NORMAL] = packed(bg), [rg.BASE_COLOR_FOCUSED] = packed(bg),
         [rg.BASE_COLOR_PRESSED] = packed(bg),
     }, function() return rg.textbox_multi(x, y, w, h, value, edit, enter_sends) end)

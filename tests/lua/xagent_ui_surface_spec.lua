@@ -21,7 +21,7 @@ spec.describe('rounded UI surfaces', function()
         rg.textbox_multi = function(x, y, w, h, value, edit, sends)
             spec.equal(x, 12); spec.equal(w, 300)
             spec.equal(value, '草稿'); spec.equal(edit, false); spec.equal(sends, true)
-            spec.equal(rg.get_style(rg.TEXTBOX, rg.BORDER_COLOR_PRESSED), 0x141e28ff)
+            spec.equal(rg.get_style(rg.TEXTBOX, rg.BORDER_COLOR_PRESSED), 42)
             return '草稿', false, nil
         end
         local value, edit, sent = surface.editor(rg, {20,30,40,255}, 12, 20, 300, 78, '草稿', false, true)
