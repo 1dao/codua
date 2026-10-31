@@ -72,6 +72,8 @@ end
 
 local IS_WIN = (package.config:sub(1, 1) == '\\')
 local FONT_SIZE = 16
+-- Rasterize above the largest UI heading (26px), then draw at logical sizes.
+local FONT_ATLAS_SIZE = 32
 
 -- Starting per-turn output cap. A bigger cap is free — you only pay for tokens
 -- actually produced — but a TOO-SMALL cap silently breaks big outputs: an
@@ -1304,7 +1306,7 @@ local function apply_theme(name)
 
     S.view_bg = bg
     S.header_bg = base
-    S.sidebar_bg = shift(bg, dark and 8 or -8)
+    S.sidebar_bg = name == 'soft' and { 250, 248, 248, 255 } or shift(bg, dark and 8 or -8)
     for _, tab in ipairs(S.tabs) do
         if tab.view then tab.view.bg = bg; tab.view:invalidate() end
     end
@@ -1470,7 +1472,7 @@ local function draw_tabbar(W)
 
     local n = #S.tabs
     local plus_w = 30
-    local avail = W - 6 - plus_w - 8 - (S.panel and 104 or 0)   -- room for the panel's 关闭
+    local avail = W - 6 - plus_w - 8 - (S.panel and 40 or 0)   -- room for the panel close icon
     local tw = math.max(70, math.min(180, math.floor(avail / math.max(1, n)) - 2))
     local ry, rh = y + 3, TABBAR_H - 5
     local x = 6
@@ -1511,7 +1513,7 @@ local function draw_tabbar(W)
 
     -- the right panel's close button sits in this row, above the panel itself
     -- (inside the panel it would collide with each page's own header buttons)
-    if S.panel and flat_button(W - 102, ry, 96, rh, '#113# 关闭') then S.panel = nil end
+    if S.panel and flat_button(W - 38, ry, 32, rh, '#113#') then S.panel = nil end
 
     S.plus_x = x
     if flat_button(x, ry, plus_w, rh, '+') then
@@ -1769,7 +1771,10 @@ local function draw_add_model_modal(W, H)
     raygui.draw_rectangle(mx, my, mw, mh, pb[1], pb[2], pb[3], 255)
     local ac = (markdown.palette and markdown.palette.heading) or { 110, 170, 120, 255 }
     raygui.draw_rectangle(mx, my, mw, 3, ac[1], ac[2], ac[3], 255)
-    raygui.label(mx + 16, my + 12, mw - 32, 24, f.edit
+    if raygui.button(mx + mw - 48, my + 8, 32, 30, '#113#') then
+        oauth_login.cancel(); S.add_model = nil; return
+    end
+    raygui.label(mx + 16, my + 12, mw - 80, 24, f.edit
         and ('编辑模型 · ' .. sanitize_label(f.edit.name or f.edit.model or '?')
             .. (f.auth == 'token' and '（Token 留空=不变）' or ''))
         or '新增模型')
@@ -1883,10 +1888,10 @@ local function draw_add_model_modal(W, H)
     if f.err then
         local ec = { 220, 90, 90, 255 }
         raygui.draw_rectangle(mx + pad, row, 6, 6, ec[1], ec[2], ec[3], 255)
-        raygui.label(mx + pad + 12, row - 4, mw - 2 * pad - 12, 22, f.err)
+        raygui.label(mx + pad + 12, row + 4, mw - 2 * pad - 56, 22, f.err)
     end
 
-    if raygui.button(mx + mw - 16 - 96 - 8 - 96, my + mh - 44, 96, 30, '保存') then
+    if raygui.button(mx + mw - 48, row, 32, 30, '#2#') then
         local url = (f.auth == 'chatgpt') and chatgpt_auth.endpoint
             or (f.auth == 'claude') and claude_auth.endpoint
             or (f.url or ''):gsub('^%s+', ''):gsub('%s+$', '')
@@ -1929,7 +1934,10 @@ local function draw_add_model_modal(W, H)
             if T() then T().status = '已添加模型' end
         end
     end
-    if raygui.button(mx + mw - 16 - 96, my + mh - 44, 96, 30, '取消') then oauth_login.cancel(); S.add_model = nil end
+    if S.add_model then
+        surface.tooltip(raygui, mx + mw - 48, row, 32, 30, '保存', pb,
+            (markdown.palette and markdown.palette.text) or { 40, 40, 40, 255 })
+    end
 end
 
 -- ── MCP server form (settings → MCP 服务器) ─────────────────────────────────
@@ -2065,7 +2073,10 @@ local function draw_mcp_modal(W, H)
     raygui.draw_rectangle(mx, my, mw, mh, pb[1], pb[2], pb[3], 255)
     local ac = (markdown.palette and markdown.palette.heading) or { 110, 170, 120, 255 }
     raygui.draw_rectangle(mx, my, mw, 3, ac[1], ac[2], ac[3], 255)
-    raygui.label(mx + 16, my + 12, mw - 32, 24, f.edit
+    if raygui.button(mx + mw - 48, my + 8, 32, 30, '#113#') then
+        S.mcp_form = nil; return
+    end
+    raygui.label(mx + 16, my + 12, mw - 80, 24, f.edit
         and ('编辑 MCP 服务器 · ' .. sanitize_label(f.edit)) or '添加 MCP 服务器')
 
     local fx = mx + pad + lblw + 8
@@ -2114,12 +2125,12 @@ local function draw_mcp_modal(W, H)
     if f.err then
         local ec = { 220, 90, 90, 255 }
         raygui.draw_rectangle(mx + pad, row + 8, 6, 6, ec[1], ec[2], ec[3], 255)
-        raygui.label(mx + pad + 12, row + 4, mw - 2 * pad - 12, 22, f.err)
+        raygui.label(mx + pad + 12, row + 4, mw - 2 * pad - 56, 22, f.err)
     end
 
     local by = my + mh - 44
     if f.edit then
-        if raygui.button(mx + pad, by, 110, 30, f.confirm_delete and '确认删除' or '删除') then
+        if raygui.button(mx + pad, by, f.confirm_delete and 110 or 32, 30, f.confirm_delete and '确认删除' or '#143#') then
             if not f.confirm_delete then
                 f.confirm_delete = true
             else
@@ -2134,7 +2145,7 @@ local function draw_mcp_modal(W, H)
             end
         end
     end
-    if raygui.button(mx + mw - 16 - 96 - 8 - 96, by, 96, 30, '保存') then
+    if raygui.button(mx + mw - 48, row, 32, 30, '#2#') then
         if S.mcp_status == 'connecting' then
             f.err = 'MCP 正在连接，请稍后再保存'
         else
@@ -2150,22 +2161,25 @@ local function draw_mcp_modal(W, H)
             end
         end
     end
-    if raygui.button(mx + mw - 16 - 96, by, 96, 30, '取消') then S.mcp_form = nil end
+    if S.mcp_form then
+        surface.tooltip(raygui, mx + mw - 48, row, 32, 30, '保存', pb,
+            (markdown.palette and markdown.palette.text) or { 40, 40, 40, 255 })
+    end
 end
 
 -- MCP sidebar page: one row per server (click = edit), plus 添加/重连.
 local function draw_mcp_section(x0, pad, y, H)
     local right = x0 + SIDEBAR_W - pad
     raygui.label(x0 + pad, y + 2, SIDEBAR_W - 2 * pad - 130, 22, 'MCP 服务器')
-    if raygui.button(right - 126, y, 60, 26, '添加') then open_mcp_form() end
+    if raygui.button(right - 70, y, 32, 26, '+') then open_mcp_form() end
     local busy = S.mcp_status == 'connecting'
-    if raygui.button(right - 60, y, 60, 26, busy and '连接中' or '重连') and not busy then
+    if raygui.button(right - 32, y, 32, 26, '#211#') and not busy then
         reload_mcp()
     end
     local ry = y + 32
     local conns = mcp_registry.connections()
     if #conns == 0 then
-        raygui.label(x0 + pad, ry, SIDEBAR_W - 2 * pad, 22, busy and '（连接中…）' or '（未配置，点击“添加”）')
+        raygui.label(x0 + pad, ry, SIDEBAR_W - 2 * pad, 22, busy and '（连接中…）' or '（未配置，点击 + 添加服务器）')
         return
     end
     for i, c in ipairs(conns) do
@@ -2279,6 +2293,8 @@ end
 -- ones, which lag a frame behind each move and make the window jitter.
 local function window_chrome(W, H)
     local down = raygui.mouse_down()
+    local maximized = raygui.is_window_maximized()
+    if maximized then S.win_grab = nil end
     local press = down and not S.win_prev_down
     S.win_prev_down = down
     local g = S.win_grab
@@ -2301,7 +2317,6 @@ local function window_chrome(W, H)
     end
 
     local mx, my = raygui.get_mouse()
-    local maximized = raygui.is_window_maximized()
     local edge = maximized and '' or edge_at(mx, my, W, H)
     set_cursor(EDGE_CURSOR[edge] or 0)
     if not press then return false end
@@ -2572,8 +2587,8 @@ local function draw_history_sidebar(x0, H, tab)
                 elseif S.menu_item == it then
                     -- ⋮ clicked: reveal 修改 / 删除 on this row
                     local bw = (title_w - kw - 8) / 2
-                    if raygui.button(rx, ry, bw, rh, '修改') then start_rename(it) end
-                    if raygui.button(rx + bw + 4, ry, bw, rh, '删除') then
+                    if raygui.button(rx, ry, bw, rh, '#22#') then start_rename(it) end
+                    if raygui.button(rx + bw + 4, ry, bw, rh, '#143#') then
                         S.confirm_delete = it.id; S.renaming = nil; S.menu_item = nil
                     end
                     if kebab_button(kx, ry, kw, rh, txt) then S.menu_item = nil end   -- 再点收起
@@ -2608,7 +2623,7 @@ end
 -- read it). Expanded nodes are remembered per directory.
 local function draw_files_sidebar(x0, H, tab)
     raygui.label(x0 + 10, TOP + 6, SIDEBAR_W - 90, 22, '工作区文件')
-    if raygui.button(x0 + SIDEBAR_W - 78, TOP + 4, 70, 26, '刷新') then S.dir_cache = {} end
+    if raygui.button(x0 + SIDEBAR_W - 40, TOP + 4, 32, 26, '#211#') then S.dir_cache = {} end
     draw_text_col(fit_label(tab.cwd or '.', SIDEBAR_W - 20, 13), x0 + 10, TOP + 36, 13, muted_col())
     draw_text_col('点击文件插入 @引用 · 点击目录展开', x0 + 10, TOP + 54, 13, muted_col())
 
@@ -2667,7 +2682,7 @@ end
 
 local function draw_apilog_sidebar(x0, H)
     raygui.label(x0 + 10, TOP + 6, SIDEBAR_W - 90, 22, 'API 请求记录')
-    if raygui.button(x0 + SIDEBAR_W - 78, TOP + 4, 70, 26, '清空') then
+    if raygui.button(x0 + SIDEBAR_W - 40, TOP + 4, 32, 26, '#143#') then
         api_log.clear(); S.apilog_selected = nil
         S.log_detail = nil; S.log_detail_for = nil
     end
@@ -2722,7 +2737,7 @@ local function draw_model_sidebar(x0, H, tab)
     local addw = 56
     local ddw = SIDEBAR_W - 2 * pad - addw - 6
     dropdown_button('model', x0 + pad, my0 + 24, ddw, 30, selp and (selp.name or selp.model) or '（无）')
-    if raygui.button(x0 + pad + ddw + 6, my0 + 24, addw, 30, '添加') then open_add_model() end
+    if raygui.button(x0 + pad + ddw + 6, my0 + 24, addw, 30, '+') then open_add_model() end
 
     local dy = my0 + 64
     if selp then
@@ -2736,9 +2751,9 @@ local function draw_model_sidebar(x0, H, tab)
         det('代理: ' .. (selp.proxy and sanitize_label(xproxy.redact(selp.proxy)) or '直连'))
         if selp.overridden then det('（已在界面修改，覆盖配置文件）') end
         dy = dy + 4
-        if raygui.button(x0 + pad, dy, 88, 28, '编辑') then open_edit_model(selp) end
+        if raygui.button(x0 + pad, dy, 32, 28, '#22#') then open_edit_model(selp) end
         if selp.source == 'json' and selp.json_index then
-            if raygui.button(x0 + pad + 96, dy, 120, 28, '删除此模型') then
+            if raygui.button(x0 + pad + 40, dy, 32, 28, '#143#') then
                 config.delete_user_model(selp.json_index)
                 reload_profiles()
             end
@@ -2767,6 +2782,7 @@ end
 local INPUT_H, TOOLBAR_H = 78, 40
 
 local function composer_color()
+    if S.theme == 'soft' then return { 255, 255, 255, 255 } end
     local bg = S.view_bg
     return mix(bg, text_col(), luma(bg) < 128 and 0.045 or 0.018)
 end
@@ -2811,7 +2827,7 @@ local function draw_composer_toolbar(tab, x, iy, w)
         tab.status = (S.mode == 'ask') and '询问模式：写操作前确认' or '写入模式：自动执行'
     end
 
-    local send_w = compact and 72 or 80
+    local send_w = 32
     local sx = x + w - send_w
     local mname = sanitize_label(tab.cfg and (tab.cfg.name or tab.cfg.model) or '?')
     local mw = math.min(200, math.max(60, w - mode_w - send_w - 60), raygui.measure_text(mname) + 40)
@@ -2825,11 +2841,12 @@ local function draw_composer_toolbar(tab, x, iy, w)
             hx, ty + 8, 13, muted_col())
     end
     if tab.busy then
-        if surface.button(raygui, sx, ty, send_w, bh, '停止', mix(bg, ac, 0.15), txt, 9) then stop_turn(tab) end
+        if surface.button(raygui, sx, ty, send_w, bh, '', mix(bg, ac, 0.15), txt, 9) then stop_turn(tab) end
+        raygui.draw_rectangle(sx + 11, ty + 10, 10, 10, txt[1], txt[2], txt[3], 255)
         return false
     end
     local ink = luma(ac) > 155 and { 30, 36, 48, 255 } or { 255, 255, 255, 255 }
-    return surface.button(raygui, sx, ty, send_w, bh, '#121# 发送', ac, ink, 9)
+    return surface.button(raygui, sx, ty, send_w, bh, '#121#', ac, ink, 9)
 end
 
 local function __init()
@@ -2842,12 +2859,15 @@ local function __init()
     -- Borderless (custom title bar in the header) when this raygui build can
     -- move/resize/minimize the window; otherwise keep the OS frame.
     S.frameless = (raygui.mouse_screen and raygui.set_window_pos and raygui.minimize_window) and true or false
-    raygui.init(960, 700, 'xagent', { undecorated = S.frameless })
-    -- Pre-seed glyphs (eliminates streaming flicker); fall back to ASCII-only.
-    if not raygui.load_system_font(FONT_SIZE, preseed_charset()) and
-       not raygui.load_font('tools/fonts/NotoSansSC-Regular.otf', FONT_SIZE, preseed_charset()) then
-        raygui.load_font('tools/fonts/NotoSansSC-Regular.otf', FONT_SIZE)
-    end
+    raygui.init(960, 700, 'xagent', {
+        undecorated = S.frameless,
+        desktop_maximize = IS_WIN and S.frameless,
+    })
+    -- A larger atlas avoids enlarging 16px bitmaps for headings while keeping
+    -- the existing font metrics and all UI geometry in logical pixels.
+    local charset = preseed_charset()
+    local font_loaded = raygui.load_system_font(FONT_ATLAS_SIZE, charset)
+    if not font_loaded then raygui.load_font('tools/fonts/NotoSansSC-Regular.otf', FONT_ATLAS_SIZE, charset) end
 
     -- Color emoji come from the atlas (the font has no emoji glyphs).
     S.emoji_tex = raygui.load_texture('tools/emoji_atlas.png')

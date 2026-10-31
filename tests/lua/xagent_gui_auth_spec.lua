@@ -23,6 +23,7 @@ local cfg = setmetatable({
 }, {__index=config})
 local env = setmetatable({
     S=S, config=cfg, markdown={}, sanitize_label=function(s) return s end,
+    surface=require('xagent.ui.surface'),
     xproxy=dofile('scripts/core/share/xproxy.lua'),
     xutils={get_config=function() end}, open_url={open=function() return true end},
     reload_profiles=function() S.profiles={saved} end, T=function() end,
@@ -33,6 +34,7 @@ local env = setmetatable({
         return require(name)
     end,
     raygui={
+        get_mouse=function() return -1,-1 end,
         draw_rectangle=function() end,
         label=function(_,_,_,_,text) fields[text]=true end,
         textbox=function(_,_,_,_,text,edit) return text,edit end,
@@ -67,7 +69,7 @@ spec.describe('GUI authentication form',function()
         ui.open(); frame('授权'); frame('登录 Claude'); frame()
         spec.truthy(fields['授权码'])
         spec.truthy(buttons['提交浏览器返回的完整授权码'])
-        login.cancel(); S.add_model.model='claude-test'; frame('保存')
+        login.cancel(); S.add_model.model='claude-test'; frame('#2#')
         spec.equal(saved.auth_type,'claude')
         spec.equal(saved.proxy,'socks5://127.0.0.1:1080')
         spec.equal(saved.base_url,accounts.claude.endpoint)

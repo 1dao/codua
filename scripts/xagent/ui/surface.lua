@@ -58,4 +58,17 @@ function M.editor(rg, bg, x, y, w, h, value, edit, enter_sends)
     }, function() return rg.textbox_multi(x, y, w, h, value, edit, enter_sends) end)
 end
 
+function M.tooltip(rg, x, y, w, h, label, bg, ink)
+    local mx, my = rg.get_mouse()
+    if mx < x or mx >= x + w or my < y or my >= y + h then return end
+    local sw, sh = rg.screen_size()
+    local width, height = rg.measure_text(label, 14) + 20, 28
+    local left = math.max(4, math.min(mx + 12, sw - width - 4))
+    local top = my + 20
+    if top + height > sh - 4 then top = y - height - 6 end
+    M.rounded(rg, left - 1, top - 1, width + 2, height + 2, 7, ink)
+    M.rounded(rg, left, top, width, height, 6, bg)
+    rg.draw_text(label, left + 10, top + 7, 14, table.unpack(ink))
+end
+
 return M
