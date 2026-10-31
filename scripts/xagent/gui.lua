@@ -31,6 +31,7 @@ local async         = dofile('scripts/core/share/xasync.lua') ---@type xasync
 local xproxy        = dofile('scripts/core/share/xproxy.lua')
 local api_log       = require('xagent.llm.api_log')
 local user_input    = require('xagent.ui.user_input')
+local surface       = require('xagent.ui.surface')
 
 registry.register(require('xagent.tools.read'))
 registry.register(require('xagent.tools.write'))
@@ -174,7 +175,7 @@ local S = {
 
 local SIDEBAR_W = 300
 local HEADER_H  = 38               -- top bar (title/status/meter/toggles)
-local TABBAR_H  = 32               -- tab strip below the top bar
+local TABBAR_H  = 40               -- tab strip below the top bar
 local TOP       = HEADER_H + TABBAR_H   -- top y of the sidebar / main content
 local THEMES = { 'nord', 'soft', 'candy', 'cyber', 'dark' }
 local THEME_FILE = (fs.home():gsub('[/\\]+$', '')) .. '/.xagent/theme'
@@ -785,6 +786,7 @@ local function submit()
     end
     local text = (tab.input or ''):gsub('^%s+', ''):gsub('%s+$', '')
     if text == '' and #tab.attachments == 0 then return end
+    tab.welcome = false
     if text:sub(1, 1) == '/' and handle_slash(text) then return end
 
     -- With attachments the user turn becomes content BLOCKS: image blocks
@@ -1141,6 +1143,7 @@ local function load_history_item(it)
     tab.sess = s2
     tab.cwd = s2.cwd or tab.cwd                   -- this tab follows the resumed session's dir
     tab.entries = rebuild_entries(s2.transcript)   -- full history, not the compacted context
+    tab.welcome = false
     tab.cur, tab.text_tail, tab.busy = nil, '', false
     tab.budget = nil                              -- meter restarts on the next turn
     tab.pending_confirm = nil
@@ -1189,6 +1192,7 @@ function new_session()
     tab.sess.confirm = make_confirm(tab, tab.sess)
     tab.sess.request_user_input = user_input.bind(tab, tab.sess)
     tab.entries = {}
+    tab.welcome = true
     tab.cur, tab.text_tail, tab.busy = nil, '', false
     tab.budget = nil                             -- meter restarts on the next turn
     tab.pending_confirm = nil
@@ -1209,7 +1213,7 @@ function new_tab(cfg, cwd)
         id = S.next_tab_id,
         cfg = cfg,
         entries = {}, cur = nil, text_tail = '',
-        input = '', input_edit = true,
+        input = '', input_edit = true, welcome = true,
         busy = false, status = 'ready', budget = nil,
         pending_confirm = nil, attachments = {},
         cwd = cwd,
@@ -1483,7 +1487,8 @@ local function draw_tabbar(W)
         end
         local over = my >= ry and my < ry + rh and mx >= x and mx < x + tw
         local closable = (n > 1 and over)            -- show the close affordance on hover
-        local clicked = flat_button(x, ry, tw, rh, '  ' .. sanitize_label(label))
+        local tab_bg = active and mix(bg, ac, 0.10) or bg
+        local clicked = surface.button(raygui, x, ry, tw, rh, '  ' .. fit_label(sanitize_label(label), tw - 38), tab_bg, tc, 8)
         if active then raygui.draw_rectangle(x + 6, ry + rh - 1, tw - 12, 2, ac[1], ac[2], ac[3], 255) end
         -- The close 'x' is a FRAMELESS icon drawn over the tab's right edge (a
         -- nested button would draw a second border inside the tab and look
@@ -1606,9 +1611,12 @@ local function dropdown_button(id, x, y, w, h, current)
 end
 
 -- Flat variant of dropdown_button (no frame until hovered), for toolbars.
-local function flat_dropdown(id, x, y, w, h, current)
+local function flat_dropdown(id, x, y, w, h, current, bg)
     local open = (S.dd_open == id)
-    local clicked = flat_button(x, y, w, h, '  ' .. sanitize_label(current or '（无）'))
+    local label = '  ' .. sanitize_label(current or '（无）')
+    local clicked
+    if bg then clicked = surface.button(raygui, x, y, w, h, label, bg, markdown.palette.text, 7)
+    else clicked = flat_button(x, y, w, h, label) end
     local col = (markdown.palette and markdown.palette.text) or { 200, 200, 200, 255 }
     draw_caret(x + w - 12, y + h / 2, col, open)
     if clicked then S.dd_open = open and nil or id end
@@ -2401,7 +2409,7 @@ local function draw_header(W, tab)
     local chip_bg = shift(bg, (luma(bg) < 128) and 16 or -12)
     local chip = S.picking_dir and '选择中…' or fit_label(dir_name(tab.cwd), 160)
     local cw = raygui.measure_text(chip) + 22
-    if flat_button(x, 8, cw, 22, chip, chip_bg) then pick_directory() end
+    if surface.button(raygui, x, 8, cw, 22, chip, chip_bg, txt, 7) then pick_directory() end
     hits[#hits + 1] = { x, 8, cw, 22 }
     x = x + cw + 14
 
@@ -2756,47 +2764,72 @@ end
 -- ── composer ────────────────────────────────────────────────────────────────
 -- The input box plus a toolbar row under it, so everything that shapes the next
 -- message sits next to it: [+ 引用文件] [permission mode] hints … [发送 / 停止].
-local INPUT_H, TOOLBAR_H = 74, 32
+local INPUT_H, TOOLBAR_H = 78, 40
 
--- Draws the toolbar under the input box at (x, iy, w); returns true when the
--- send button was clicked.
+local function composer_color()
+    local bg = S.view_bg
+    return mix(bg, text_col(), luma(bg) < 128 and 0.045 or 0.018)
+end
+
+local function draw_welcome(tab, x, y, w, h)
+    local center = x + w / 2
+    local top = y + math.max(12, math.floor(h * 0.32) - 32)
+    local function centered(label, yy, size, col)
+        draw_text_col(label, math.floor(center - raygui.measure_text(label, size) / 2), yy, size, col)
+    end
+    centered('从一个想法开始', top, 26, text_col())
+    centered('读懂项目、修改代码，或一起解决一个问题。', top + 44, 16, muted_col())
+    local choices = {
+        { '理解项目', '请介绍当前项目的结构、主要模块和运行方式。' },
+        { '实现功能', '我想在当前项目中实现一个功能：' },
+        { '排查问题', '帮我排查当前项目中的问题：' },
+    }
+    local gap = 10
+    local bw = math.min(144, math.floor((w - 2 * gap) / 3))
+    local left = math.floor(center - (3 * bw + 2 * gap) / 2)
+    if h > 190 and bw >= 80 then
+        for i, item in ipairs(choices) do
+            if surface.button(raygui, left + (i - 1) * (bw + gap), top + 92, bw, 38,
+                item[1], mix(S.view_bg, accent_col(), 0.065), text_col(), 10) then
+                tab.input, tab.input_edit, tab.input_edit_forced = item[2], true, true
+            end
+        end
+    end
+end
+
 local function draw_composer_toolbar(tab, x, iy, w)
-    local ty = iy + INPUT_H + 4
-    local bh = TOOLBAR_H - 4
-    if flat_button(x, ty, 32, bh, '+') then insert_file_ref('') end   -- '@' → file picker
+    local ty, bh = iy + INPUT_H + 4, 30
+    local bg, txt, ac = composer_color(), text_col(), accent_col()
+    if surface.button(raygui, x, ty, 30, bh, '+', bg, txt, 8) then insert_file_ref('') end
 
-    -- permission mode: write = auto-run · ask = confirm each state-changing tool
-    local mode_w = 132
-    local mode_lbl = (S.mode == 'ask') and '询问 · 写前确认' or '写入 · 自动执行'
-    if flat_button(x + 38, ty, mode_w, bh, mode_lbl) then
+    local compact = w < 620
+    local mode_w = compact and 62 or 132
+    local mode_lbl = (S.mode == 'ask') and (compact and '询问' or '询问 · 写前确认')
+        or (compact and '写入' or '写入 · 自动执行')
+    if surface.button(raygui, x + 36, ty, mode_w, bh, mode_lbl, bg, txt, 7) then
         S.mode = (S.mode == 'ask') and 'write' or 'ask'
         tab.status = (S.mode == 'ask') and '询问模式：写操作前确认' or '写入模式：自动执行'
     end
 
-    local send_w = 80
+    local send_w = compact and 72 or 80
     local sx = x + w - send_w
-
-    -- model picker (this tab) left of the send button, like a chat app's
-    -- model selector; its list opens upward
     local mname = sanitize_label(tab.cfg and (tab.cfg.name or tab.cfg.model) or '?')
-    local mw = math.min(200, raygui.measure_text(mname) + 40)
-    local mx = sx - 8 - mw
-    flat_dropdown('tabmodel', mx, ty, mw, bh, mname)
+    local mw = math.min(200, math.max(60, w - mode_w - send_w - 60), raygui.measure_text(mname) + 40)
+    local mx = sx - 10 - mw
+    flat_dropdown('tabmodel', mx, ty, mw, bh, fit_label(mname, mw - 38), bg)
 
-    local hx = x + 38 + mode_w + 12
-    local room = (mx - 12) - hx
-    if room > 60 then
+    local hx = x + 36 + mode_w + 12
+    local room = mx - 12 - hx
+    if room > 100 then
         draw_text_col(fit_label('Enter 发送 · Ctrl+Enter 换行 · Ctrl+V 贴图', room, 13),
             hx, ty + 8, 13, muted_col())
     end
-
     if tab.busy then
-        if raygui.button(sx, ty, send_w, bh, '') then stop_turn(tab) end
-        raygui.draw_rectangle(sx + 16, ty + math.floor(bh / 2) - 5, 10, 10, 215, 95, 85, 255)
-        draw_text_col('停止', sx + 34, ty + math.floor((bh - FONT_SIZE) / 2), FONT_SIZE, text_col())
+        if surface.button(raygui, sx, ty, send_w, bh, '停止', mix(bg, ac, 0.15), txt, 9) then stop_turn(tab) end
         return false
     end
-    return raygui.button(sx, ty, send_w, bh, '#121# 发送')   -- ICON_ARROW_UP_FILL
+    local ink = luma(ac) > 155 and { 30, 36, 48, 255 } or { 255, 255, 255, 255 }
+    return surface.button(raygui, sx, ty, send_w, bh, '#121# 发送', ac, ink, 9)
 end
 
 local function __init()
@@ -2928,10 +2961,10 @@ local function __update()
     -- conversation takes the space between them: lx .. rx
     local lx, rx = 0, W
     local sb = S.sidebar_bg
-    -- Keep the answer controls usable in a narrow window; restore sidebars
-    -- automatically once there is room or the question has been answered.
-    local show_sidebar = S.sidebar and (not tab.pending_input or W >= SIDEBAR_W + 360)
-    local show_panel = S.panel and (not tab.pending_input or W >= (show_sidebar and 2 or 1) * SIDEBAR_W + 360)
+    -- Keep the composer usable when panels would leave less than 360px.
+    -- Retain the selected pages so resizing wider brings them back.
+    local show_sidebar = S.sidebar and W >= SIDEBAR_W + 360
+    local show_panel = S.panel and W >= (show_sidebar and 2 or 1) * SIDEBAR_W + 360
     if show_sidebar then
         lx = SIDEBAR_W
         raygui.draw_rectangle(0, TOP, SIDEBAR_W, H - TOP, sb[1], sb[2], sb[3], sb[4])
@@ -2950,12 +2983,13 @@ local function __update()
 
     -- transcript (right of the sidebar); attachments shrink it a bit more
     local answering = tab.pending_input ~= nil
-    local comp_h = INPUT_H + TOOLBAR_H
+    local comp_h = INPUT_H + TOOLBAR_H + 36
     local att_h = (#tab.attachments > 0) and 58 or 0
     local question_h = answering and math.min(user_input.height(tab, rx - lx - 16,
         function(s) return raygui.measure_text(s, 16) end), H - TOP - comp_h - att_h - 24) or 0
-    local tx, ty = lx + 8, TOP + 4
-    local tw, th = rx - lx - 16, math.max(0, H - ty - comp_h - question_h - att_h - 12 - (answering and 10 or 0))
+    local content_pad = math.min(48, math.max(20, math.floor((rx - lx) * 0.04)))
+    local tx, ty = lx + content_pad, TOP + 16
+    local tw, th = rx - lx - 2 * content_pad, math.max(0, H - ty - comp_h - question_h - att_h - 12 - (answering and 10 or 0))
     if th > 24 and S.panel == 'apilog' and S.apilog_selected then
         local rec = S.apilog_selected
         -- rebuild the detail if the record finished since it was first shown
@@ -2966,12 +3000,17 @@ local function __update()
         end
         S.log_view:draw(S.log_detail, tx, ty, tw, th)
     elseif th > 24 then
-        tab.view:draw(tab.entries, tx, ty, tw, th)
+        local fresh = tab.welcome and not tab.busy
+        for _, entry in ipairs(tab.entries) do
+            if entry.role ~= 'system' then fresh = false; break end
+        end
+        if fresh and th > 150 then draw_welcome(tab, tx, ty, tw, th)
+        else tab.view:draw(tab.entries, tx, ty, tw, th) end
     end
 
     -- attachment strip: pasted images as thumbnails, each with a ✗ to remove
     if att_h > 0 then
-        local ax, ay, thumb = lx + 8, H - comp_h - att_h - 2, 48
+        local ax, ay, thumb = lx + 32, H - comp_h - att_h - 2, 48
         local remove_i
         for i, a in ipairs(tab.attachments) do
             local tw2 = math.max(24, math.min(96, math.floor(thumb * a.w / a.h + 0.5)))
@@ -2989,7 +3028,12 @@ local function __update()
     -- input: Enter sends, Ctrl+Enter inserts a newline; the toolbar under it
     -- has the send/stop button. textbox_multi reads raw keys (not raygui-
     -- locked), so its edit mode is forced off while the directory dialog is open.
-    local iy = H - comp_h - 4
+    local iy = H - comp_h + 12
+    local composer_x, composer_w = lx + 32, rx - lx - 64
+    local card_bg = composer_color()
+    local edge = mix(S.view_bg, tab.input_edit and accent_col() or text_col(), tab.input_edit and 0.48 or 0.16)
+    surface.rounded(raygui, composer_x - 12, iy - 12, composer_w + 24, INPUT_H + TOOLBAR_H + 24, 16, edge)
+    surface.rounded(raygui, composer_x - 11, iy - 11, composer_w + 22, INPUT_H + TOOLBAR_H + 22, 15, card_bg)
     if answering then
         local colors = {
             bg = S.sidebar_bg, text = text_col(),
@@ -2999,17 +3043,17 @@ local function __update()
             colors, modal or grabbing, stop_turn)
     end
     local new_input, submitted, new_edit
-    new_input, new_edit, submitted = raygui.textbox_multi(
-        lx + 8, iy, rx - lx - 16, INPUT_H, tab.input,
+    new_input, new_edit, submitted = surface.editor(raygui, card_bg,
+        composer_x, iy, composer_w, INPUT_H, tab.input,
         (not modal and not answering) and tab.input_edit or false, true)
     -- The card owns keyboard input while waiting. Keep the original
     -- composer and its draft visible without letting a second editor consume keys.
     if not answering then tab.input = new_input end
     if tab.input == '' then   -- placeholder (the caret sits just left of it)
-        draw_text_col(fit_label('问点什么，或描述一个任务…   / 命令 · @ 引用文件', rx - lx - 40),
-            lx + 18, iy + 10, FONT_SIZE, muted_col())
+        draw_text_col(fit_label('问点什么，或描述一个任务…   / 命令 · @ 引用文件', composer_w - 20),
+            composer_x + 8, iy + 10, FONT_SIZE, muted_col())
     end
-    local send_clicked = draw_composer_toolbar(tab, lx + 8, iy, rx - lx - 16)
+    local send_clicked = draw_composer_toolbar(tab, composer_x, iy, composer_w)
 
     -- live / @ autocomplete menu, recomputed from the (possibly edited) input
     update_completion_menu()
@@ -3038,7 +3082,7 @@ local function __update()
 
     -- popup is drawn above the input box (after focus handling, so a row click
     -- can re-focus the box); only shows while a / or @ token is present
-    draw_completion_menu(lx, iy, rx)
+    draw_completion_menu(lx + 12, iy - 12, rx - 12)
     -- the "+" new-tab model picker (anchored under the tab bar)
     draw_tab_picker(W, H)
 

@@ -13,7 +13,9 @@ local function frame(answering, draft)
     local tab = { input = draft, input_edit = true }
     local env = setmetatable({
         answering = answering, modal = false, tab = tab, S = {},
-        lx = 20, rx = 620, iy = 400, INPUT_H = 74, FONT_SIZE = 16,
+        lx = 20, rx = 620, iy = 400, INPUT_H = 78, FONT_SIZE = 16,
+        composer_x = 52, composer_w = 536, card_bg = {},
+        surface = { editor = function(rg, bg, ...) return rg.textbox_multi(...) end },
         raygui = { textbox_multi = function(x, y, w, h, value, edit)
             input = {x=x, y=y, w=w, h=h, value=value, edit=edit}
             return 'new text', true, true
@@ -29,13 +31,13 @@ local function frame(answering, draft)
 end
 
 spec.describe('GUI composer while answering questions', function()
-    spec.it('uses the original input and toolbar geometry in both states', function()
+    spec.it('uses the same input and toolbar geometry in both states', function()
         local waiting, normal = frame(true, ''), frame(false, '')
         for _, key in ipairs({'x','y','w','h'}) do spec.equal(waiting.input[key], normal.input[key]) end
         for _, key in ipairs({'x','y','w'}) do spec.equal(waiting.toolbar[key], normal.toolbar[key]) end
-        spec.equal(waiting.input.x, 28); spec.equal(waiting.input.y, 400)
-        spec.equal(waiting.input.w, 584); spec.equal(waiting.input.h, 74)
-        spec.equal(waiting.toolbar.x, 28); spec.equal(waiting.toolbar.w, 584)
+        spec.equal(waiting.input.x, 52); spec.equal(waiting.input.y, 400)
+        spec.equal(waiting.input.w, 536); spec.equal(waiting.input.h, 78)
+        spec.equal(waiting.toolbar.x, 52); spec.equal(waiting.toolbar.w, 536)
         spec.contains(waiting.placeholder, '问点什么，或描述一个任务')
         spec.nil_value(waiting.sent); spec.truthy(normal.sent)
     end)
