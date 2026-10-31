@@ -163,7 +163,7 @@ local S = {
     menu_item = nil,           -- history item whose ⋮ menu is open
     menu_y = 0,                -- screen y of that menu
     -- theme
-    theme = 'sand',
+    theme = 'soft',
     header_bg = { 30, 30, 38, 255 },
     sidebar_bg = { 26, 26, 32, 255 },
     picking_dir = false,       -- a folder dialog is currently open
@@ -2948,7 +2948,7 @@ local function __init()
     -- Apply the saved (or default) color theme (sets S.view_bg for new tabs).
     local saved = fs.read_file(THEME_FILE)
     saved = saved and saved:gsub('%s+', '')
-    apply_theme((saved and saved ~= '') and saved or 'sand')
+    apply_theme((saved and saved ~= '') and saved or 'soft')
 
     -- Default the first tab's dir to the last picked one (persisted across
     -- launches); fall back to the process cwd if none saved or it's gone.
