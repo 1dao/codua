@@ -2132,7 +2132,14 @@ local function draw_mcp_modal(W, H)
 
     local by = my + mh - 44
     if f.edit then
-        if raygui.button(mx + pad, by, f.confirm_delete and 110 or 32, 30, f.confirm_delete and '确认删除' or '#143#') then
+        local delete_clicked
+        if f.confirm_delete then
+            delete_clicked = raygui.button(mx + pad, by, 110, 30, '确认删除')
+        else
+            delete_clicked = surface.icon_button(raygui, mx + pad, by, 32, 30, 'delete', pb,
+                (markdown.palette and markdown.palette.text) or { 40, 40, 40, 255 })
+        end
+        if delete_clicked then
             if not f.confirm_delete then
                 f.confirm_delete = true
             else
@@ -2605,17 +2612,17 @@ local function draw_history_sidebar(x0, H, tab)
                 local it = row.item
                 if it.id == S.renaming then
                     S.rename_text, S.rename_edit = raygui.textbox(rx, ry, title_w - 2 * kw - 8, rh, S.rename_text, S.rename_edit)
-                    if raygui.button(kx2, ry, kw, rh, '#112#') then do_rename(it) end        -- ✓ 保存
-                    if raygui.button(kx, ry, kw, rh, '#113#') then S.renaming = nil end       -- ✗ 取消
+                    if surface.icon_button(raygui, kx2, ry, kw, rh, 'confirm', S.sidebar_bg, txt) then do_rename(it) end
+                    if surface.icon_button(raygui, kx, ry, kw, rh, 'cancel', S.sidebar_bg, txt) then S.renaming = nil end
                 elseif it.id == S.confirm_delete then
                     raygui.label(rx + 4, ry + 4, title_w - 2 * kw - 30, rh - 8, '删除？')
-                    if raygui.button(kx2, ry, kw, rh, '#112#') then do_delete(it) end         -- ✓ 确认删除
-                    if raygui.button(kx, ry, kw, rh, '#113#') then S.confirm_delete = nil end  -- ✗ 取消
+                    if surface.icon_button(raygui, kx2, ry, kw, rh, 'confirm', S.sidebar_bg, txt) then do_delete(it) end
+                    if surface.icon_button(raygui, kx, ry, kw, rh, 'cancel', S.sidebar_bg, txt) then S.confirm_delete = nil end
                 elseif S.menu_item == it then
                     -- ⋮ clicked: reveal 修改 / 删除 on this row
                     local bw = (title_w - kw - 8) / 2
-                    if raygui.button(rx, ry, bw, rh, '#22#') then start_rename(it) end
-                    if raygui.button(rx + bw + 4, ry, bw, rh, '#143#') then
+                    if surface.icon_button(raygui, rx, ry, bw, rh, 'edit', S.sidebar_bg, txt) then start_rename(it) end
+                    if surface.icon_button(raygui, rx + bw + 4, ry, bw, rh, 'delete', S.sidebar_bg, txt) then
                         S.confirm_delete = it.id; S.renaming = nil; S.menu_item = nil
                     end
                     if kebab_button(kx, ry, kw, rh, txt) then S.menu_item = nil end   -- 再点收起
@@ -2722,7 +2729,7 @@ end
 
 local function draw_apilog_sidebar(x0, H)
     raygui.label(x0 + 10, TOP + 6, SIDEBAR_W - 90, 22, 'API 请求记录')
-    if raygui.button(x0 + SIDEBAR_W - 40, TOP + 4, 32, 26, '#143#') then
+    if surface.icon_button(raygui, x0 + SIDEBAR_W - 40, TOP + 4, 32, 26, 'delete', S.sidebar_bg, text_col()) then
         api_log.clear(); S.apilog_selected = nil
         S.log_detail = nil; S.log_detail_for = nil
     end
@@ -2791,9 +2798,9 @@ local function draw_model_sidebar(x0, H, tab)
         det('代理: ' .. (selp.proxy and sanitize_label(xproxy.redact(selp.proxy)) or '直连'))
         if selp.overridden then det('（已在界面修改，覆盖配置文件）') end
         dy = dy + 4
-        if raygui.button(x0 + pad, dy, 32, 28, '#22#') then open_edit_model(selp) end
+        if surface.icon_button(raygui, x0 + pad, dy, 32, 28, 'edit', S.sidebar_bg, text_col()) then open_edit_model(selp) end
         if selp.source == 'json' and selp.json_index then
-            if raygui.button(x0 + pad + 40, dy, 32, 28, '#143#') then
+            if surface.icon_button(raygui, x0 + pad + 40, dy, 32, 28, 'delete', S.sidebar_bg, text_col()) then
                 config.delete_user_model(selp.json_index)
                 reload_profiles()
             end

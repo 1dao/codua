@@ -68,6 +68,48 @@ function M.icon(rg, x, y, kind)
         M.rounded(rg, ix, iy + 6, 20, 12, 2, { 202, 143, 42, 255 })
         M.rounded(rg, ix + 1, iy + 8, 18, 10, 2, { 246, 193, 83, 255 })
         rect(2, 8, 16, 1, { 255, 219, 137, 255 })
+    elseif kind == 'delete' then
+        M.rounded(rg, ix + 4, iy + 5, 12, 14, 2, { 187, 68, 76, 255 })
+        M.rounded(rg, ix + 5, iy + 6, 10, 12, 1, { 232, 111, 117, 255 })
+        M.rounded(rg, ix + 7, iy + 1, 6, 4, 1, { 187, 68, 76, 255 })
+        rect(8, 2, 4, 2, { 255, 220, 222, 255 })
+        M.rounded(rg, ix + 2, iy + 4, 16, 3, 1, { 216, 86, 96, 255 })
+        rect(7, 9, 1, 7, { 255, 220, 222, 255 })
+        rect(10, 9, 1, 7, { 255, 220, 222, 255 })
+        rect(13, 9, 1, 7, { 255, 220, 222, 255 })
+    elseif kind == 'confirm' then
+        local green = { 49, 157, 111, 255 }
+        for step = 0, 4 do rect(3 + step, 9 + step, 2, 2, green) end
+        for step = 0, 9 do rect(7 + step, 13 - step, 2, 2, green) end
+    elseif kind == 'cancel' then
+        local red = { 216, 86, 96, 255 }
+        for step = 0, 11 do
+            rect(4 + step, 4 + step, 2, 2, red)
+            rect(15 - step, 4 + step, 2, 2, red)
+        end
+    elseif kind == 'edit' then
+        -- Use one diagonal axis for the tip, barrel and eraser, rather than
+        -- joining independently positioned rectangles that appear bent.
+        local blue, edge = { 53, 119, 215, 255 }, { 37, 91, 176, 255 }
+        local light, wood = { 157, 200, 255, 255 }, { 231, 191, 133, 255 }
+        local tip, eraser = { 75, 87, 107, 255 }, { 135, 178, 237, 255 }
+        for py = 0, 19 do
+            for px = 0, 19 do
+                local along = (px - py + 16) / 2
+                local across = (px + py - 20) / 2
+                local width = math.min(1.5, along / 3)
+                if along >= 0 and along <= 15 and math.abs(across) <= width then
+                    local color
+                    if along < 1 then color = tip
+                    elseif along < 4.5 then color = wood
+                    elseif along >= 13 then color = eraser
+                    elseif math.abs(across) >= 1.5 then color = edge
+                    elseif across <= -0.5 then color = light
+                    else color = blue end
+                    rect(px, py, 1, 1, color)
+                end
+            end
+        end
     end
 end
 
