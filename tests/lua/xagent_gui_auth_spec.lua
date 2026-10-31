@@ -6,7 +6,7 @@ local source = file:read('*a'); file:close()
 assert(load(source, '@gui.lua'))
 local modal = assert(source:match('(local function open_add_model%(%)\n.-)local function __init%(%)'))
 local S = { sidebar_bg = {20,20,20} }
-local clicked, buttons, fields, saved, active
+local clicked, buttons, fields, saved, active, opened_url, open_ok
 local accounts = {
     chatgpt = {endpoint='https://chatgpt.com/backend-api/codex/responses', label='ChatGPT'},
     claude = {endpoint='https://api.anthropic.com', label='Claude'},
@@ -27,7 +27,7 @@ local env = setmetatable({
         icon_button=function(rg,x,y,w,h,kind) return rg.button(x,y,w,h,kind == 'save' and '#2#' or '') end,
     }, {__index=require('xagent.ui.surface')}),
     xproxy=dofile('scripts/core/share/xproxy.lua'),
-    xutils={get_config=function() end}, open_url={open=function() return true end},
+    xutils={get_config=function() end}, open_url={open=function(url) opened_url=url; return open_ok ~= false end},
     reload_profiles=function() S.profiles={saved} end, T=function() end,
     require=function(name)
         if name == 'xagent.auth.login' then return login end
@@ -48,6 +48,66 @@ local function frame(click)
     clicked=click; buttons={}; fields={}; ui.draw(960,700)
 end
 spec.describe('GUI authentication form',function()
+    spec.it('imports a NVIDIA key and saves the prefilled OpenAI profile only after confirmation',function()
+        saved=nil; opened_url=nil
+        ui.open(); frame('免费模型'); frame()
+        spec.truthy(S.add_model.free_setup)
+        spec.nil_value(saved)
+        frame('打开官网注册 / 登录')
+        spec.equal(opened_url,'https://build.nvidia.com/settings/api-keys')
+        frame('打开创建 Token 页面')
+        spec.equal(opened_url,'https://build.nvidia.com/settings/api-keys')
+        frame('下一步：模型配置')
+        spec.truthy(S.add_model.free_setup)
+        spec.truthy(S.add_model.err)
+        S.add_model.token='  offline-test-key  '
+        frame('下一步：模型配置'); frame()
+        spec.nil_value(S.add_model.free_setup)
+        spec.nil_value(saved)
+        spec.equal(S.add_model.token,'offline-test-key')
+        frame('#2#')
+        spec.equal(saved.base_url,'https://integrate.api.nvidia.com/v1')
+        spec.equal(saved.model,'nvidia/nemotron-3-ultra-550b-a55b')
+        spec.equal(saved.api_format,'openai')
+        spec.equal(saved.api_key,'offline-test-key')
+        spec.nil_value(S.add_model)
+    end)
+    spec.it('keeps NVIDIA onboarding open on browser failure and discards cancelled credentials',function()
+        saved=nil; open_ok=false
+        ui.open(); frame('免费模型')
+        frame('打开创建 Token 页面')
+        spec.equal(S.add_model.err,'无法打开浏览器，请稍后重试')
+        S.add_model.token='not a key'; frame('下一步：模型配置')
+        spec.truthy(S.add_model.free_setup)
+        spec.contains(S.add_model.err,'空白')
+        frame('#113#')
+        spec.nil_value(S.add_model); spec.nil_value(saved)
+        open_ok=true
+    end)
+    spec.it('defaults the free-model dropdown to NVIDIA and resets keys when switching providers',function()
+        saved=nil
+        ui.open(); frame('免费模型'); frame()
+        spec.equal(S.add_model.free_provider,1)
+        spec.truthy(buttons['NVIDIA ▼'])
+        S.add_model.token='provider-specific-test-key'
+        frame('NVIDIA ▼')
+        spec.truthy(buttons.NVIDIA)
+        spec.truthy(buttons['智谱'])
+        spec.truthy(buttons['Cohere North Mini Code (OpenRouter)'])
+        frame('Cohere North Mini Code (OpenRouter)'); frame()
+        spec.equal(S.add_model.token,'')
+        spec.equal(S.add_model.free_provider,3)
+        spec.equal(S.add_model.model,'cohere/north-mini-code:free')
+        spec.equal(S.add_model.url,'https://openrouter.ai/api/v1')
+        spec.equal(S.add_model.name,'Cohere North Mini Code (OpenRouter)')
+        frame('打开创建 Token 页面')
+        spec.equal(opened_url,'https://openrouter.ai/keys')
+        frame('Cohere North Mini Code (OpenRouter) ▼'); frame('智谱'); frame()
+        spec.equal(S.add_model.model,'glm-4.7-flash')
+        spec.equal(S.add_model.api_format,'openai')
+        spec.nil_value(saved)
+        frame('#113#')
+    end)
     spec.it('defaults to token and reveals account choices only after authorization',function()
         ui.open(); frame()
         spec.equal(S.add_model.auth,'token'); spec.truthy(fields.Token)

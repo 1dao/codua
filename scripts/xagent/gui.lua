@@ -1707,6 +1707,31 @@ local function open_add_model()
                     err = nil }
 end
 
+local free_model_presets = {
+    { label = 'NVIDIA', name = 'Nemotron 3 Ultra (NVIDIA)',
+      url = 'https://integrate.api.nvidia.com/v1', model = 'nvidia/nemotron-3-ultra-550b-a55b',
+      signup = 'https://build.nvidia.com/settings/api-keys',
+      key_url = 'https://build.nvidia.com/settings/api-keys',
+      instruction = '完成邮箱登录和验证后，点击 Generate API Key' },
+    { label = '智谱', name = 'GLM-4.7-Flash (智谱)',
+      url = 'https://open.bigmodel.cn/api/paas/v4', model = 'glm-4.7-flash',
+      signup = 'https://bigmodel.cn', key_url = 'https://bigmodel.cn/usercenter/proj-mgmt/apikeys',
+      instruction = '在 API Key 管理页创建密钥' },
+    { label = 'OpenRouter', choice_label = 'Cohere North Mini Code (OpenRouter)',
+      name = 'Cohere North Mini Code (OpenRouter)',
+      url = 'https://openrouter.ai/api/v1', model = 'cohere/north-mini-code:free',
+      signup = 'https://openrouter.ai', key_url = 'https://openrouter.ai/keys',
+      instruction = '在 Keys 页面创建 API Key' },
+}
+
+local function select_free_model(f, index)
+    local p = free_model_presets[index]
+    f.free_provider = index
+    f.auth, f.name, f.url, f.model, f.api_format = 'token', p.name, p.url, p.model, 'openai'
+    -- A key belongs to its provider; never carry it into a different account.
+    f.token, f.token_e, f.err, f.free_dropdown = '', false, nil, false
+end
+
 -- Open the same form prefilled with profile `p`. Fields hold the profile's OWN
 -- values (explicit name, own proxy — not the inherited default) so saving only
 -- records what the user actually changed; Token starts empty (= keep).
@@ -1766,7 +1791,8 @@ local function draw_add_model_modal(W, H)
     if raygui.is_key_pressed and raygui.is_key_pressed(raygui.KEY_ESCAPE) then
         oauth_login.cancel(); S.add_model = nil; return
     end
-    local mw, mh = 520, (f.auth == 'claude' and oauth_login.running(claude_auth)) and 552 or 480
+    local mw, mh = 520, (f.auth == 'claude' and oauth_login.running(claude_auth)) and 552
+        or (f.free_setup and 520 or 480)
     local mx, my = math.floor((W - mw) / 2), math.floor((H - mh) / 2)
     raygui.draw_rectangle(mx - 2, my - 2, mw + 4, mh + 4, 0, 0, 0, 170)   -- shadow/border
     local pb = S.sidebar_bg
@@ -1779,7 +1805,56 @@ local function draw_add_model_modal(W, H)
     raygui.label(mx + 16, my + 12, mw - 80, 24, f.edit
         and ('编辑模型 · ' .. sanitize_label(f.edit.name or f.edit.model or '?')
             .. (f.auth == 'token' and '（Token 留空=不变）' or ''))
-        or '新增模型')
+        or (f.free_setup and '免费模型' or '新增模型'))
+
+    -- The manual setup flow keeps registration on each provider's official
+    -- page and imports only the key the user explicitly pastes here.
+    if f.free_setup then
+        local preset = free_model_presets[f.free_provider or 1]
+        local x, y, w = mx + 16, my + 56, mw - 32
+        local function hint(text)
+            raygui.label(x, y, w, 24, text); y = y + 30
+        end
+        local function open_page(url)
+            local ok = open_url.open(url)
+            f.err = not ok and '无法打开浏览器，请稍后重试' or nil
+        end
+        raygui.label(x, y + 4, 72, 24, '平台')
+        if raygui.button(x + 80, y, w - 80, 30, (preset.choice_label or preset.label) .. ' ▼') then
+            f.free_dropdown = not f.free_dropdown
+        end
+        y = y + 36
+        if f.free_dropdown then
+            for i, p in ipairs(free_model_presets) do
+                if raygui.button(x + 80, y, w - 80, 30, p.choice_label or p.label) then select_free_model(f, i) end
+                y = y + 32
+            end
+            return
+        end
+        hint('1. 注册或登录 ' .. preset.label .. ' 账号')
+        if raygui.button(x, y, w, 30, '打开官网注册 / 登录') then open_page(preset.signup) end
+        y = y + 42
+        hint('2. ' .. preset.instruction)
+        if raygui.button(x, y, w, 30, '打开创建 Token 页面') then open_page(preset.key_url) end
+        y = y + 42
+        hint('3. 复制新密钥，回到这里粘贴（Ctrl+V）')
+        f.token, f.token_e = raygui.textbox(x, y, w, 30, f.token, f.token_e)
+        y = y + 42
+        hint('模型和 API 地址将自动填写，下一步检查并保存。')
+        hint('免费试用受平台限流与数据使用条款约束。')
+        if f.err then hint(f.err) end
+        if raygui.button(x, my + mh - 58, w, 32, '下一步：模型配置') then
+            local token = (f.token or ''):gsub('^%s+', ''):gsub('%s+$', '')
+            if token == '' then
+                f.err = '请先粘贴 ' .. preset.label .. ' API Key'
+            elseif token:find('%s') then
+                f.err = '密钥包含空白，请只复制 API Key'
+            else
+                f.token, f.token_e, f.free_setup, f.err = token, false, nil, nil
+            end
+        end
+        return
+    end
 
     local pad, lblw = 16, 84
     local fx = mx + pad + lblw + 8
@@ -1891,8 +1966,16 @@ local function draw_add_model_modal(W, H)
         local ec = { 220, 90, 90, 255 }
         raygui.draw_rectangle(mx + pad, row, 6, 6, ec[1], ec[2], ec[3], 255)
         raygui.label(mx + pad + 12, row + 4, mw - 2 * pad - 56, 22, f.err)
+        row = row + rh + 6
     end
 
+    if not f.edit and raygui.button(mx + pad, row, 112, 30, '免费模型') then
+        oauth_login.cancel()
+        -- Replace the unsaved form, without persisting credentials yet.
+        S.add_model = { proxy = f.proxy or '', free_setup = true, free_preset = true }
+        select_free_model(S.add_model, 1)
+        return
+    end
     if surface.icon_button(raygui, mx + mw - 48, row, 32, 30, 'save', pb,
         (markdown.palette and markdown.palette.text) or { 40, 40, 40, 255 }) then
         local url = (f.auth == 'chatgpt') and chatgpt_auth.endpoint
@@ -1910,6 +1993,8 @@ local function draw_add_model_modal(W, H)
         end
         if url == '' or url == 'https://' or model == '' then
             f.err = '请至少填写 API地址 和 模型ID'
+        elseif f.free_preset and f.auth == 'token' and token == '' then
+            f.err = '请填写 API Key'
         elseif account and not logged_in then
             f.err = '请先登录 ' .. account.label
         elseif perr and proxy:lower() ~= 'direct' and proxy:lower() ~= 'none' then
