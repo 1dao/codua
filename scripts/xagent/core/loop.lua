@@ -160,7 +160,7 @@ function M.run(opts)
         end
 
         -- Run the requested tools and append their results as a user turn.
-        local tool_results = tools_run.run(assistant.content, opts.ctx, opts.on_event)
+        local tool_results = tools_run.run(assistant.content, opts.ctx, opts.on_event, opts.should_stop)
         messages[#messages + 1] = { role = 'user', content = tool_results }
     end
 

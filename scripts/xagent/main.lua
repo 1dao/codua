@@ -8,6 +8,7 @@
 --   .\bin\xnet.exe scripts\xagent\main.lua
 --   .\bin\xnet.exe scripts\xagent\main.lua "PROMPT=read scripts\core\share\xsse.lua and summarize it"
 --   .\bin\xnet.exe scripts\xagent\main.lua MODEL=deepseek-v4-pro MAX_TOKENS=4096
+--   Add INTERACTIVE=1 to allow the agent to ask questions through stdin.
 
 package.path = 'scripts/?.lua;' .. package.path
 
@@ -161,7 +162,16 @@ local function __init()
             io.stderr:write('[mcp] ' .. tostring(e) .. '\n')
         end
 
+        local cancelled = false
         local ctx = { cwd = cwd }
+        if argv.INTERACTIVE == '1' then
+            registry.register(require('xagent.tools.ask_user_question'))
+            ctx.request_user_input = function(request)
+                local reply = require('xagent.ui.console_input').request(request)
+                if reply.cancelled then cancelled = true end
+                return reply
+            end
+        end
         local sys = system_prompt.build({ cwd = cwd,
             mcp_instructions = require('xagent.mcp.registry').instructions() })
         local rem = skills.reminder()
@@ -180,6 +190,7 @@ local function __init()
             ctx = ctx,
             max_tokens = max_tokens,
             on_event = make_printer(),
+            should_stop = function() return cancelled end,
         })
 
         -- in = uncached input; cache_read/cache_write are billed separately.

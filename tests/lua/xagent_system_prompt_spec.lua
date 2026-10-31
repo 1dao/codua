@@ -24,6 +24,7 @@ spec.describe('system_prompt.build without hooks (desktop)', function()
         spec.contains(sys, sp.DOCS_LOOKUP)
         spec.contains(sys, 'issue them together in one response')
         spec.contains(sys, 'Read only that range with offset/limit')
+        spec.contains(sys, 'When AskUserQuestion is available')
     end)
 
     spec.it('orders rules, environment, project memory', function()

@@ -37,6 +37,7 @@ local CODING = {
     'When the CodeExplore tool is available, use it first to locate or understand code: name the functions, classes or files involved and it returns their source, callers and callees in one call. Use Grep for text that is not a symbol (strings, config keys, log messages) or when CodeExplore finds nothing.',
     'For large files, locate the relevant part first (CodeExplore, else Grep), then Read only that range with offset/limit instead of the whole file; do not re-read content already in the conversation.',
     M.DOCS_LOOKUP,
+    'When AskUserQuestion is available, use it to request a user decision or missing information that materially affects the task. Offer concise choices when useful; omit choices for free-text input. Wait for the actual answer, never invent it. For routine implementation details, use reasonable judgment instead of asking.',
     'When you have finished the task, stop and give a short summary of what you did or found.',
 }
 

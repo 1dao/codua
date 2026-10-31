@@ -21,7 +21,7 @@ end
 -- ctx: tool context ({ cwd, ... }).
 -- on_event: optional fn(event) for UI/headless surfacing.
 -- Returns an array of tool_result blocks (user-message content).
-function M.run(content_blocks, ctx, on_event)
+function M.run(content_blocks, ctx, on_event, should_stop)
     local function emit(ev) if on_event then on_event(ev) end end
     local results = {}
     local guard = ctx and ctx.tool_guard
@@ -35,7 +35,9 @@ function M.run(content_blocks, ctx, on_event)
             local tool = registry.find(block.name)
             local res
             local blocked = guard and guard.check(block.name)
-            if blocked then
+            if should_stop and should_stop() then
+                res = { content = 'Error: task cancelled by the user; tool was not executed.', is_error = true }
+            elseif blocked then
                 res = { content = blocked, is_error = true }
             elseif type(input) == 'table' and input._error ~= nil and input._raw ~= nil then
                 -- The streamed tool arguments did not arrive as valid JSON, so we
@@ -54,7 +56,12 @@ function M.run(content_blocks, ctx, on_event)
                 res = { content = 'Error: 用户拒绝执行该工具调用（询问模式）', is_error = true }
             else
                 -- auto-allow all tools when "write" mode.
-                local ok, r = pcall(tool.call, input, ctx)
+                local ok, r
+                if should_stop and should_stop() then
+                    ok, r = true, { content = 'Error: task cancelled by the user; tool was not executed.', is_error = true }
+                else
+                    ok, r = pcall(tool.call, input, ctx)
+                end
                 if ok and type(r) == 'table' then
                     res = r
                 elseif ok then

@@ -30,6 +30,7 @@ local fs            = dofile('scripts/core/share/xfs.lua') ---@type xfs
 local async         = dofile('scripts/core/share/xasync.lua') ---@type xasync
 local xproxy        = dofile('scripts/core/share/xproxy.lua')
 local api_log       = require('xagent.llm.api_log')
+local user_input    = require('xagent.ui.user_input')
 
 registry.register(require('xagent.tools.read'))
 registry.register(require('xagent.tools.write'))
@@ -44,6 +45,7 @@ registry.register(require('xagent.tools.web_fetch'))
 registry.register(require('xagent.tools.memory_write'))
 registry.register(require('xagent.tools.todo_write').tool)
 registry.register(require('xagent.tools.skill'))
+registry.register(require('xagent.tools.ask_user_question'))
 for _, tool in ipairs(require('xagent.tools.file_ops').tools()) do registry.register(tool) end
 
 local skills    = require('xagent.skills')
@@ -97,7 +99,7 @@ local function preseed_charset()
     range(0x25A0, 0x25FF)   -- geometric shapes (○ ● ◦ ■ □ ▲ ▶ …)
     range(0x2600, 0x26FF)   -- misc symbols (★ ☆ ☰ ☐ ☑ …; only those in the font load)
     -- specific common symbols outside the ranges above
-    for _, cp in ipairs({ 0x00A0, 0x00B0, 0x00B1, 0x00B7, 0x00D7, 0x00F7,
+    for _, cp in ipairs({ 0x00A0, 0x00B0, 0x00B1, 0x00B7, 0x00D7, 0x00F7, 0x2039, 0x203A,
                           0x00A2, 0x00A3, 0x00A5, 0x00A9, 0x00AE, 0x20AC, 0x2122,
                           0xFE19,            -- ︙ vertical kebab (the font lacks ⋮ U+22EE)
                           0x2713, 0x2714, 0x2705, 0x274C, 0x2714 }) do
@@ -345,7 +347,7 @@ end
 local function update_thinking(tab)
     -- Waiting for output: busy, nothing streaming yet, not parked on a
     -- permission prompt (that has its own UI).
-    if not (tab.busy and not tab.cur and not tab.pending_confirm) then
+    if not (tab.busy and not tab.cur and not tab.pending_confirm and not tab.pending_input) then
         clear_thinking(tab); return
     end
     local text = 'thinking' .. ('.'):rep(1 + math.floor(S.frame / 20) % 3)
@@ -368,18 +370,26 @@ local function compact(v)
 end
 
 -- Per-session permission gate handed to the agent (ctx.confirm). In 'write' mode
--- (or for a turn whose session the tab has since replaced) it auto-allows; in
+-- it auto-allows; in
 -- 'ask' mode it parks the agent coroutine on an await until the user clicks
 -- 允许/拒绝. The await lives on the OWNING tab, so a background tab can park its
 -- own confirm (surfaced via a '!' on its tab button) without blocking others.
 -- Runs inside the agent coroutine, so async.await is safe here.
 local function make_confirm(tab, sess)
     return function(req)
+        if sess.cancelled or tab.sess ~= sess then return false end
         if S.mode ~= 'ask' then return true end
-        if tab.sess ~= sess then return true end   -- stale run of a replaced session: don't block
         return async.await(function(resolve)
             tab.pending_confirm = { req = req, resolve = resolve }
         end)
+    end
+end
+
+local function cancel_session(tab)
+    if tab.sess then tab.sess.cancelled = true end
+    user_input.cancel(tab)
+    if tab.pending_confirm then
+        local pc = tab.pending_confirm; tab.pending_confirm = nil; pc.resolve(false)
     end
 end
 
@@ -453,7 +463,8 @@ local function on_event(tab, ev)
         tab.status = string.format('输出较大，提升上限重试 (%s→%s)',
             tostring(ev.from or '?'), tostring(ev.to or '?'))
     elseif ev.type == 'done' then
-        flush_tail(tab); clear_thinking(tab); tab.busy = false; tab.status = '完成'
+        flush_tail(tab); clear_thinking(tab); tab.busy = false
+        tab.status = ev.stop_reason == 'cancelled' and '已停止' or '完成'
         -- This turn's totals over every request it made (tool round-trips too);
         -- the header shows them next to the status until the next turn ends.
         if ev.usage and tokens.total_input_tokens(ev.usage) > 0 then
@@ -1121,11 +1132,12 @@ local function load_history_item(it)
     local tab = T()
     local s2 = session.load(it.path, { cfg = tab.cfg })
     if not s2 then tab.status = 'load failed'; return end
-    if tab.sess then tab.sess.cancelled = true end   -- stop a still-running turn at its next boundary
+    cancel_session(tab)
     s2.tools = registry.to_api_params()
     s2.system = build_system(s2.cwd)
     s2.max_tokens = MAX_TOKENS
     s2.confirm = make_confirm(tab, s2)
+    s2.request_user_input = user_input.bind(tab, s2)
     tab.sess = s2
     tab.cwd = s2.cwd or tab.cwd                   -- this tab follows the resumed session's dir
     tab.entries = rebuild_entries(s2.transcript)   -- full history, not the compacted context
@@ -1167,7 +1179,7 @@ end
 function new_session()
     local tab = T()
     if not tab.cfg then return end
-    if tab.sess then tab.sess.cancelled = true end   -- stop a still-running turn at its next boundary
+    cancel_session(tab)
     local cwd = tab.cwd or (tab.sess and tab.sess.cwd) or '.'
     tab.sess = session.new({
         cfg = tab.cfg, cwd = cwd, tools = registry.to_api_params(),
@@ -1175,6 +1187,7 @@ function new_session()
         max_tokens = MAX_TOKENS,
     })
     tab.sess.confirm = make_confirm(tab, tab.sess)
+    tab.sess.request_user_input = user_input.bind(tab, tab.sess)
     tab.entries = {}
     tab.cur, tab.text_tail, tab.busy = nil, '', false
     tab.budget = nil                             -- meter restarts on the next turn
@@ -1213,6 +1226,7 @@ function new_tab(cfg, cwd)
         max_tokens = MAX_TOKENS,
     })
     tab.sess.confirm = make_confirm(tab, tab.sess)
+    tab.sess.request_user_input = user_input.bind(tab, tab.sess)
     S.tabs[#S.tabs + 1] = tab
     S.active = #S.tabs
     S.menu, S.menu_sel, S.menu_off, S.menu_dismissed_for = nil, 1, 0, nil
@@ -1231,10 +1245,7 @@ function close_tab(i)
     if #S.tabs <= 1 then return end
     local tab = S.tabs[i]
     if not tab then return end
-    if tab.sess then tab.sess.cancelled = true end
-    if tab.pending_confirm then                  -- release a parked confirm so the coroutine unwinds
-        local pc = tab.pending_confirm; tab.pending_confirm = nil; pc.resolve(false)
-    end
+    cancel_session(tab)
     clear_attachments(tab)
     local was_active = S.active
     table.remove(S.tabs, i)                      -- the view is plain Lua; GC reclaims it
@@ -1363,7 +1374,7 @@ local completion_deps = { slash_items = slash_items, list_dir = list_dir_cached 
 local function update_completion_menu()
     S.menu = nil
     local tab = T()
-    if tab.busy or S.dir_dialog or tab.pending_confirm or S.tab_picker or S.add_model or S.mcp_form then return end
+    if tab.busy or S.dir_dialog or tab.pending_confirm or tab.pending_input or S.tab_picker or S.add_model or S.mcp_form then return end
     local menu = complete.compute(tab.input, completion_deps)
     if not menu then S.menu_dismissed_for = nil; return end
     if raygui.is_key_pressed and raygui.is_key_pressed(raygui.KEY_ESCAPE) then
@@ -1465,10 +1476,10 @@ local function draw_tabbar(W)
     for i, tab in ipairs(S.tabs) do
         local active = (i == S.active)
         local label = (tab.cfg and tab.cfg.name) or '?'
-        if tab.busy then
-            label = label .. ' ' .. ('.'):rep(1 + math.floor(S.frame / 20) % 3)
-        elseif tab.pending_confirm then
+        if tab.pending_confirm or tab.pending_input then
             label = label .. '  !'
+        elseif tab.busy then
+            label = label .. ' ' .. ('.'):rep(1 + math.floor(S.frame / 20) % 3)
         end
         local over = my >= ry and my < ry + rh and mx >= x and mx < x + tw
         local closable = (n > 1 and over)            -- show the close affordance on hover
@@ -2214,11 +2225,8 @@ end
 -- boundary). A parked ask-mode confirm is released as a deny so the loop can
 -- reach that boundary instead of hanging on the prompt.
 local function stop_turn(tab)
-    if tab.sess then tab.sess.cancelled = true end
-    if tab.pending_confirm then
-        local pc = tab.pending_confirm; tab.pending_confirm = nil; pc.resolve(false)
-    end
     tab.status = '停止中'
+    cancel_session(tab)
 end
 
 -- ── frameless window chrome ─────────────────────────────────────────────────
@@ -2920,12 +2928,16 @@ local function __update()
     -- conversation takes the space between them: lx .. rx
     local lx, rx = 0, W
     local sb = S.sidebar_bg
-    if S.sidebar then
+    -- Keep the answer controls usable in a narrow window; restore sidebars
+    -- automatically once there is room or the question has been answered.
+    local show_sidebar = S.sidebar and (not tab.pending_input or W >= SIDEBAR_W + 360)
+    local show_panel = S.panel and (not tab.pending_input or W >= (show_sidebar and 2 or 1) * SIDEBAR_W + 360)
+    if show_sidebar then
         lx = SIDEBAR_W
         raygui.draw_rectangle(0, TOP, SIDEBAR_W, H - TOP, sb[1], sb[2], sb[3], sb[4])
         draw_history_sidebar(0, H, tab)
     end
-    if S.panel then
+    if show_panel then
         local x0 = W - SIDEBAR_W
         rx = x0
         raygui.draw_rectangle(x0, TOP, SIDEBAR_W, H - TOP, sb[1], sb[2], sb[3], sb[4])
@@ -2937,11 +2949,14 @@ local function __update()
     end
 
     -- transcript (right of the sidebar); attachments shrink it a bit more
+    local answering = tab.pending_input ~= nil
     local comp_h = INPUT_H + TOOLBAR_H
     local att_h = (#tab.attachments > 0) and 58 or 0
+    local question_h = answering and math.min(user_input.height(tab, rx - lx - 16,
+        function(s) return raygui.measure_text(s, 16) end), H - TOP - comp_h - att_h - 24) or 0
     local tx, ty = lx + 8, TOP + 4
-    local tw, th = rx - lx - 16, H - ty - comp_h - att_h - 12
-    if S.panel == 'apilog' and S.apilog_selected then
+    local tw, th = rx - lx - 16, math.max(0, H - ty - comp_h - question_h - att_h - 12 - (answering and 10 or 0))
+    if th > 24 and S.panel == 'apilog' and S.apilog_selected then
         local rec = S.apilog_selected
         -- rebuild the detail if the record finished since it was first shown
         if S.log_detail_for ~= rec or S.log_detail_done ~= rec.done then
@@ -2950,7 +2965,7 @@ local function __update()
             S.log_detail_done = rec.done
         end
         S.log_view:draw(S.log_detail, tx, ty, tw, th)
-    else
+    elseif th > 24 then
         tab.view:draw(tab.entries, tx, ty, tw, th)
     end
 
@@ -2975,10 +2990,21 @@ local function __update()
     -- has the send/stop button. textbox_multi reads raw keys (not raygui-
     -- locked), so its edit mode is forced off while the directory dialog is open.
     local iy = H - comp_h - 4
-    local submitted, new_edit
-    tab.input, new_edit, submitted = raygui.textbox_multi(
+    if answering then
+        local colors = {
+            bg = S.sidebar_bg, text = text_col(),
+            accent = (markdown.palette and markdown.palette.heading) or { 110, 170, 120, 255 },
+        }
+        user_input.draw(tab, raygui, lx + 8, iy - question_h - att_h - 10, rx - lx - 16, question_h,
+            colors, modal or grabbing, stop_turn)
+    end
+    local new_input, submitted, new_edit
+    new_input, new_edit, submitted = raygui.textbox_multi(
         lx + 8, iy, rx - lx - 16, INPUT_H, tab.input,
-        (not modal) and tab.input_edit or false, true)
+        (not modal and not answering) and tab.input_edit or false, true)
+    -- The card owns keyboard input while waiting. Keep the original
+    -- composer and its draft visible without letting a second editor consume keys.
+    if not answering then tab.input = new_input end
     if tab.input == '' then   -- placeholder (the caret sits just left of it)
         draw_text_col(fit_label('问点什么，或描述一个任务…   / 命令 · @ 引用文件', rx - lx - 40),
             lx + 18, iy + 10, FONT_SIZE, muted_col())
@@ -2988,7 +3014,7 @@ local function __update()
     -- live / @ autocomplete menu, recomputed from the (possibly edited) input
     update_completion_menu()
 
-    if not S.dir_dialog then
+    if not S.dir_dialog and not answering then
         -- the toolbar's '+' / a file-tree click may have just focused the box
         tab.input_edit = new_edit or tab.input_edit_forced
         tab.input_edit_forced = nil
@@ -3043,7 +3069,7 @@ local function __update()
     -- Ctrl+V with an image on the clipboard (flag set inside textbox_multi):
     -- grab it as PNG, make a thumbnail texture, queue as an attachment.
     local png, pw, ph = raygui.take_pasted_image()
-    if png then
+    if png and not answering then
         local tex = raygui.load_texture_mem(png)
         tab.attachments[#tab.attachments + 1] = { png = png, w = pw, h = ph, tex = tex }
         tab.status = '已附加图片 ' .. pw .. '×' .. ph
@@ -3085,6 +3111,7 @@ local function __update()
 end
 
 local function __uninit()
+    for _, tab in ipairs(S.tabs) do cancel_session(tab) end
     oauth_login.cancel()
     mcp.shutdown()             -- stdio MCP servers must not outlive the GUI
     -- Join the process workers while this state is still alive (see xproc.shutdown).

@@ -93,7 +93,7 @@ function M.dir()
     return (fs.home():gsub('[/\\]+$', '')) .. '/.xagent/sessions'
 end
 
--- opts: { cfg, cwd, tools, system, max_tokens, id? }
+-- opts: { cfg, cwd, tools, system, max_tokens, id?, request_user_input? }
 function M.new(opts)
     opts = opts or {}
     return setmetatable({
@@ -103,6 +103,7 @@ function M.new(opts)
         tools = opts.tools,
         system = opts.system,
         max_tokens = opts.max_tokens,
+        request_user_input = opts.request_user_input,
         title = opts.title,        -- custom display name (nil → derived from 1st msg)
         messages = {},
         transcript = {},
@@ -254,7 +255,8 @@ function Session:run(on_event)
         messages = self.messages,
         system = self.system,
         tools = self.tools,
-        ctx = { cwd = self.cwd, session_id = self.id, confirm = self.confirm, tool_guard = self.tool_guard },
+        ctx = { cwd = self.cwd, session_id = self.id, confirm = self.confirm, tool_guard = self.tool_guard,
+            request_user_input = self.request_user_input },
         max_tokens = self.max_tokens,
         on_event = function(event)
             if event.type == 'assistant' then
@@ -365,6 +367,7 @@ function M.load(path, opts)
     local s = M.new({
         cfg = opts.cfg, cwd = t.cwd, tools = opts.tools,
         system = opts.system, max_tokens = opts.max_tokens, id = t.id,
+        request_user_input = opts.request_user_input,
     })
     s.messages = t.messages or {}
     s.transcript = {}
