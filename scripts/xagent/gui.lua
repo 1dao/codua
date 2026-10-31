@@ -163,7 +163,7 @@ local S = {
     menu_item = nil,           -- history item whose ⋮ menu is open
     menu_y = 0,                -- screen y of that menu
     -- theme
-    theme = 'nord',
+    theme = 'sand',
     header_bg = { 30, 30, 38, 255 },
     sidebar_bg = { 26, 26, 32, 255 },
     picking_dir = false,       -- a folder dialog is currently open
@@ -180,7 +180,7 @@ local SIDEBAR_W = 300
 local HEADER_H  = 38               -- top bar (title/status/meter/toggles)
 local TABBAR_H  = 40               -- tab strip below the top bar
 local TOP       = HEADER_H + TABBAR_H   -- top y of the sidebar / main content
-local THEMES = { 'nord', 'soft', 'candy', 'cyber', 'dark' }
+local THEMES = { 'sand', 'soft', 'candy', 'cyber', 'dark' }
 local THEME_FILE = (fs.home():gsub('[/\\]+$', '')) .. '/.xagent/theme'
 -- Last picked working directory, persisted so the NEXT app launch defaults its
 -- initial session to it (mirrors how THEME_FILE persists the color theme).
@@ -1275,6 +1275,7 @@ end
 -- (transcript bg/text, markdown palette, role colors) by reading the style's
 -- BACKGROUND/TEXT/accent via get_style. One click re-themes the whole window.
 local function apply_theme(name)
+    if name == 'nord' then name = 'sand' end -- migrate the saved theme name
     pcall(function() require('styles.' .. name).apply(raygui) end)
     raygui.set_style(raygui.DEFAULT, raygui.TEXT_SIZE, FONT_SIZE)
     raygui.set_style(raygui.DEFAULT, raygui.TEXT_ALIGNMENT, raygui.TEXT_ALIGN_LEFT)
@@ -2947,7 +2948,7 @@ local function __init()
     -- Apply the saved (or default) color theme (sets S.view_bg for new tabs).
     local saved = fs.read_file(THEME_FILE)
     saved = saved and saved:gsub('%s+', '')
-    apply_theme((saved and saved ~= '') and saved or 'nord')
+    apply_theme((saved and saved ~= '') and saved or 'sand')
 
     -- Default the first tab's dir to the last picked one (persisted across
     -- launches); fall back to the process cwd if none saved or it's gone.
