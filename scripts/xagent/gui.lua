@@ -148,7 +148,8 @@ local S = {
     history_scroll = 0,        -- pixel scroll offset of the history list
     history_query = '',        -- history search text (title substring)
     history_query_edit = false,
-    history_cwd_only = false,  -- list only sessions of the active tab's directory
+    history_collapsed = false,
+    history_group_open = {},  -- directory key -> explicit expanded/collapsed override
     files_open = {},           -- dir_key(cwd) -> { [rel_dir] = true } expanded tree nodes
     files_scroll = 0,          -- pixel scroll of the file tree
     -- API request/response log panel (in-memory, this run only)
@@ -2480,9 +2481,35 @@ local function draw_header(W, tab)
 end
 
 -- ── sidebar pages ───────────────────────────────────────────────────────────
--- Left sidebar — history: search + "this directory only" filter, sessions grouped by working
+-- Left sidebar — history: search + group folding, sessions grouped by working
 -- directory, each row showing its title over a muted "time · message count"
 -- line (near-identical titles are otherwise impossible to tell apart).
+-- Preserve the session list's recency order. Folding changes visibility of
+-- sessions, never which projects are present in the history overview.
+local function build_history_groups(items, query, collapsed, open_by_key, key_for_dir)
+    local groups, by_key, shown = {}, {}, 0
+    local q = (query or ''):lower():gsub('^%s+', ''):gsub('%s+$', '')
+    for _, item in ipairs(items) do
+        local dir = item.cwd or '?'
+        local key = key_for_dir(dir)
+        local matches = q == '' or dir:lower():find(q, 1, true)
+            or tostring(item.title or ''):lower():find(q, 1, true)
+        if matches then
+            local group = by_key[key]
+            if not group then
+                local expanded = open_by_key[key]
+                if expanded == nil then expanded = not collapsed or q ~= '' end
+                group = { key = key, dir = dir, items = {}, expanded = expanded }
+                groups[#groups + 1], by_key[key] = group, group
+            end
+            group.items[#group.items + 1] = item
+            shown = shown + 1
+        end
+    end
+    return groups, shown
+end
+
+
 local function draw_history_sidebar(x0, H, tab)
     -- one header row: 历史会话 · [search…] · fold icon
     local lw = raygui.measure_text('历史会话') + 12
@@ -2496,51 +2523,39 @@ local function draw_history_sidebar(x0, H, tab)
         draw_text_col('搜索…', fx + 8, TOP + 9, FONT_SIZE, muted_col())
     end
 
-    -- fold icon: ⊟ while every directory is listed (click: collapse to the
-    -- current directory), ⊞ while collapsed (click: show all again)
+    -- Folding hides session rows while retaining every project header.
     local bx = x0 + SIDEBAR_W - 8 - fold_w
     if flat_button(bx, TOP + 4, fold_w, 26, '', S.sidebar_bg) then
-        S.history_cwd_only = not S.history_cwd_only
+        S.history_collapsed = not S.history_collapsed
+        S.history_group_open = {}
         S.history_scroll = 0
+        S.menu_item = nil
     end
     do
-        local c = S.history_cwd_only and accent_col() or text_col()
+        local c = S.history_collapsed and accent_col() or text_col()
         local n, ix, iy = 11, bx + math.floor((fold_w - 11) / 2), TOP + 4 + math.floor((26 - 11) / 2)
         raygui.draw_rectangle(ix, iy, n, 1, c[1], c[2], c[3], 255)
         raygui.draw_rectangle(ix, iy + n - 1, n, 1, c[1], c[2], c[3], 255)
         raygui.draw_rectangle(ix, iy, 1, n, c[1], c[2], c[3], 255)
         raygui.draw_rectangle(ix + n - 1, iy, 1, n, c[1], c[2], c[3], 255)
         raygui.draw_rectangle(ix + 3, iy + 5, 5, 1, c[1], c[2], c[3], 255)             -- minus
-        if S.history_cwd_only then
+        if S.history_collapsed then
             raygui.draw_rectangle(ix + 5, iy + 3, 1, 5, c[1], c[2], c[3], 255)         -- plus
         end
     end
 
-    -- filter, then group by working directory (first appearance ≈ recency)
-    local q = (S.history_query or ''):lower():gsub('^%s+', ''):gsub('%s+$', '')
+    -- Search both project paths and conversation titles.
     local cur_key = dir_key(tab.cwd)
-    local groups, by_key, shown = {}, {}, 0
-    for _, it in ipairs(S.history_items) do
-        local key = dir_key(it.cwd or '?')
-        local keep = (not S.history_cwd_only or key == cur_key)
-            and (q == '' or tostring(it.title or ''):lower():find(q, 1, true))
-        if keep then
-            shown = shown + 1
-            local g = by_key[key]
-            if not g then
-                g = { dir = it.cwd or '?', items = {} }
-                by_key[key] = g
-                groups[#groups + 1] = g
-            end
-            g.items[#g.items + 1] = it
-        end
-    end
+    local groups, shown = build_history_groups(S.history_items, S.history_query,
+        S.history_collapsed, S.history_group_open, dir_key)
     -- flatten into rows with their y offsets (headers are shorter than items)
     local HEAD_H, ITEM_H = 30, FONT_SIZE + 32
     local rows, y = {}, 0
     for _, g in ipairs(groups) do
         rows[#rows + 1] = { header = g, y = y, h = HEAD_H }; y = y + HEAD_H
-        for _, it in ipairs(g.items) do rows[#rows + 1] = { item = it, y = y, h = ITEM_H }; y = y + ITEM_H end
+        if g.expanded then
+            for _, it in ipairs(g.items) do rows[#rows + 1] = { item = it, y = y, h = ITEM_H }; y = y + ITEM_H end
+        end
     end
 
     local list_top = TOP + 38
@@ -2566,13 +2581,26 @@ local function draw_history_sidebar(x0, H, tab)
         if ry + row.h > list_top and ry < list_top + view_h then   -- skip off-screen rows
             local rh = row.h - 5
             if row.header then
-                -- directory group header; click switches this tab's dir
-                local cur = dir_key(row.header.dir) == cur_key
-                -- ◆ not ▸: NotoSansSC lacks U+25B8 (renders '?');
-                -- GB2312 geometric shapes (●◆◇○) are always present
-                if raygui.button(rx, ry, title_w, rh,
-                    (cur and '● ' or '◆ ') .. fit_label(dir_tail(row.header.dir), title_w - 40)) then
-                    apply_cwd(row.header.dir)
+                local g = row.header
+                local col = g.key == cur_key and accent_col() or txt
+                local count = tostring(#g.items)
+                local count_w = raygui.measure_text(count, 13)
+                if flat_button(rx, ry, title_w - 32, rh, '', S.sidebar_bg) then
+                    S.history_group_open[g.key] = not g.expanded
+                    S.menu_item = nil
+                end
+                if g.expanded then
+                    draw_caret(rx + 10, ry + rh / 2, col, false)
+                else
+                    for k = 0, 3 do
+                        raygui.draw_rectangle(rx + 8 + k, math.floor(ry + rh / 2) - 3 + k,
+                            1, 7 - 2 * k, col[1], col[2], col[3], 255)
+                    end
+                end
+                draw_text_col(fit_label(dir_tail(g.dir), title_w - count_w - 72), rx + 24, ry + 5, FONT_SIZE, col)
+                draw_text_col(count, kx - count_w - 10, ry + 6, 13, muted)
+                if flat_button(kx, ry, kw, rh, '#3#', S.sidebar_bg) then
+                    apply_cwd(g.dir)
                 end
             else
                 local it = row.item
