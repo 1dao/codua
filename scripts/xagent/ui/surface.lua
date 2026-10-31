@@ -50,6 +50,33 @@ function M.button(rg, x, y, w, h, label, bg, ink, radius)
     }, function() return rg.button(x, y, w, h, label) end)
 end
 
+function M.icon(rg, x, y, kind)
+    local ix, iy = math.floor(x), math.floor(y)
+    local function rect(dx, dy, rw, rh, color)
+        rg.draw_rectangle(ix + dx, iy + dy, rw, rh, table.unpack(color))
+    end
+    if kind == 'save' then
+        M.rounded(rg, ix + 1, iy, 18, 20, 3, { 37, 91, 176, 255 })
+        M.rounded(rg, ix + 2, iy + 1, 16, 18, 2, { 64, 132, 235, 255 })
+        rect(5, 1, 10, 6, { 237, 245, 255, 255 })
+        rect(11, 1, 3, 5, { 37, 91, 176, 255 })
+        M.rounded(rg, ix + 5, iy + 11, 10, 8, 1, { 249, 252, 255, 255 })
+        rect(7, 14, 6, 1, { 143, 177, 219, 255 })
+        rect(7, 17, 6, 1, { 143, 177, 219, 255 })
+    elseif kind == 'folder' then
+        M.rounded(rg, ix, iy + 3, 9, 6, 2, { 202, 143, 42, 255 })
+        M.rounded(rg, ix, iy + 6, 20, 12, 2, { 202, 143, 42, 255 })
+        M.rounded(rg, ix + 1, iy + 8, 18, 10, 2, { 246, 193, 83, 255 })
+        rect(2, 8, 16, 1, { 255, 219, 137, 255 })
+    end
+end
+
+function M.icon_button(rg, x, y, w, h, kind, bg, ink)
+    local clicked = M.button(rg, x, y, w, h, '', bg, ink, 7)
+    M.icon(rg, x + (w - 20) / 2, y + (h - 20) / 2, kind)
+    return clicked
+end
+
 function M.editor(rg, bg, x, y, w, h, value, edit, enter_sends)
     return styled(rg, rg.TEXTBOX, {
         [rg.BORDER_WIDTH] = 0,

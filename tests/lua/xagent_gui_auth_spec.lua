@@ -23,7 +23,9 @@ local cfg = setmetatable({
 }, {__index=config})
 local env = setmetatable({
     S=S, config=cfg, markdown={}, sanitize_label=function(s) return s end,
-    surface=require('xagent.ui.surface'),
+    surface=setmetatable({
+        icon_button=function(rg,x,y,w,h,kind) return rg.button(x,y,w,h,kind == 'save' and '#2#' or '') end,
+    }, {__index=require('xagent.ui.surface')}),
     xproxy=dofile('scripts/core/share/xproxy.lua'),
     xutils={get_config=function() end}, open_url={open=function() return true end},
     reload_profiles=function() S.profiles={saved} end, T=function() end,

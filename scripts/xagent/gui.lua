@@ -948,7 +948,7 @@ local function pick_directory()
         local root = IS_WIN and (((T().cwd or ''):match('^%a:') or 'C:') .. '\\') or '/'
         raygui.file_dialog_open(root, 600, 440, true)    -- dirs only
         S.dir_dialog = true
-        T().status = '选择目录…（进入目标目录后点 Select）'
+        T().status = '选择目录…（进入目标目录后点击文件夹确认图标）'
         return
     end
     return pick_directory_ps()
@@ -1892,7 +1892,8 @@ local function draw_add_model_modal(W, H)
         raygui.label(mx + pad + 12, row + 4, mw - 2 * pad - 56, 22, f.err)
     end
 
-    if raygui.button(mx + mw - 48, row, 32, 30, '#2#') then
+    if surface.icon_button(raygui, mx + mw - 48, row, 32, 30, 'save', pb,
+        (markdown.palette and markdown.palette.text) or { 40, 40, 40, 255 }) then
         local url = (f.auth == 'chatgpt') and chatgpt_auth.endpoint
             or (f.auth == 'claude') and claude_auth.endpoint
             or (f.url or ''):gsub('^%s+', ''):gsub('%s+$', '')
@@ -2146,7 +2147,8 @@ local function draw_mcp_modal(W, H)
             end
         end
     end
-    if raygui.button(mx + mw - 48, row, 32, 30, '#2#') then
+    if surface.icon_button(raygui, mx + mw - 48, row, 32, 30, 'save', pb,
+        (markdown.palette and markdown.palette.text) or { 40, 40, 40, 255 }) then
         if S.mcp_status == 'connecting' then
             f.err = 'MCP 正在连接，请稍后再保存'
         else
@@ -2585,7 +2587,7 @@ local function draw_history_sidebar(x0, H, tab)
                 local col = g.key == cur_key and accent_col() or txt
                 local count = tostring(#g.items)
                 local count_w = raygui.measure_text(count, 13)
-                if flat_button(rx, ry, title_w - 32, rh, '', S.sidebar_bg) then
+                if flat_button(rx, ry, title_w, rh, '', S.sidebar_bg) then
                     S.history_group_open[g.key] = not g.expanded
                     S.menu_item = nil
                 end
@@ -2597,11 +2599,8 @@ local function draw_history_sidebar(x0, H, tab)
                             1, 7 - 2 * k, col[1], col[2], col[3], 255)
                     end
                 end
-                draw_text_col(fit_label(dir_tail(g.dir), title_w - count_w - 72), rx + 24, ry + 5, FONT_SIZE, col)
-                draw_text_col(count, kx - count_w - 10, ry + 6, 13, muted)
-                if flat_button(kx, ry, kw, rh, '#3#', S.sidebar_bg) then
-                    apply_cwd(g.dir)
-                end
+                draw_text_col(fit_label(dir_tail(g.dir), title_w - count_w - 44), rx + 24, ry + 5, FONT_SIZE, col)
+                draw_text_col(count, rx + title_w - count_w - 10, ry + 6, 13, muted)
             else
                 local it = row.item
                 if it.id == S.renaming then
@@ -2695,8 +2694,8 @@ local function draw_files_sidebar(x0, H, tab)
         local ry = list_top + (i - 1) * row_h - S.files_scroll
         local ind = math.min(r.depth * 14, SIDEBAR_W - 80)
         local w = SIDEBAR_W - 16 - ind
-        local mark = r.dir and (open[r.path] and '◆ ' or '◇ ') or '    '
-        if raygui.button(x0 + 8 + ind, ry, w, row_h - 3, mark .. fit_label(r.name, w - 40)) then
+        local row_x, rh = x0 + 8 + ind, row_h - 3
+        if raygui.button(row_x, ry, w, rh, '') then
             if r.dir then
                 open[r.path] = (not open[r.path]) or nil
             else
@@ -2704,6 +2703,19 @@ local function draw_files_sidebar(x0, H, tab)
                 tab.status = '已引用 @' .. r.path
             end
         end
+        if r.dir then
+            local col = muted_col()
+            if open[r.path] then
+                draw_caret(row_x + 8, ry + rh / 2, col, false)
+            else
+                for k = 0, 3 do
+                    raygui.draw_rectangle(row_x + 6 + k, math.floor(ry + rh / 2) - 3 + k,
+                        1, 7 - 2 * k, col[1], col[2], col[3], 255)
+                end
+            end
+            surface.icon(raygui, row_x + 18, ry + (rh - 20) / 2, 'folder')
+        end
+        draw_text_col(fit_label(r.name, w - 52), row_x + 44, ry + 4, FONT_SIZE, text_col())
     end
     raygui.end_scissor()
 end
