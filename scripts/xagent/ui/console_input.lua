@@ -1,4 +1,4 @@
--- Explicit interactive CLI mode only; unattended runs must never read stdin.
+-- CLI question reader. Unattended callers can omit this tool with INTERACTIVE=0.
 local question_tool = require('xagent.tools.ask_user_question')
 local M = {}
 

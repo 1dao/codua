@@ -8,7 +8,7 @@
 --   .\bin\xnet.exe scripts\xagent\main.lua
 --   .\bin\xnet.exe scripts\xagent\main.lua "PROMPT=read scripts\core\share\xsse.lua and summarize it"
 --   .\bin\xnet.exe scripts\xagent\main.lua MODEL=deepseek-v4-pro MAX_TOKENS=4096
---   Add INTERACTIVE=1 to allow the agent to ask questions through stdin.
+--   Interactive questions through stdin are enabled by default; use INTERACTIVE=0 to disable.
 
 package.path = 'scripts/?.lua;' .. package.path
 
@@ -164,7 +164,7 @@ local function __init()
 
         local cancelled = false
         local ctx = { cwd = cwd }
-        if argv.INTERACTIVE == '1' then
+        if argv.INTERACTIVE ~= '0' then
             registry.register(require('xagent.tools.ask_user_question'))
             ctx.request_user_input = function(request)
                 local reply = require('xagent.ui.console_input').request(request)
