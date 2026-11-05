@@ -11,16 +11,18 @@ local function fixture()
     local rg = {
         mouse_down = function() return native.down end,
         is_window_maximized = function() return native.maximized end,
-        get_mouse = function() return 200, 100 end,
-        mouse_screen = function() return 400, 300 end,
+        get_mouse = function() return native.mx or 200, native.my or 100 end,
+        mouse_screen = function() return native.sx or 400, native.sy or 300 end,
+        window_pos = function() return 100, 100 end,
         set_mouse_cursor = function() end,
-        set_window_size = function() native.resized = native.resized + 1 end,
+        set_window_size = function(w,h) native.resized = native.resized + 1; native.size={w,h} end,
         set_window_pos = function() native.moved = native.moved + 1 end,
     }
     local env = setmetatable({ S = S, raygui = rg, HEADER_H = 38 }, { __index = _G })
     local frame = assert(load(source:sub(first, last - 1) .. '\nreturn window_chrome',
         '@window-chrome', 't', env))()
-    S.win_grab = { mode = 'e', sx = 100, sy = 100, wx = 0, wy = 0, ww = 960, wh = 700 }
+    S.win_grab = { mode = 'e', sx = 100, sy = 100, wx = 0, wy = 0, ww = 960, wh = 700,
+        min_w = 480, min_h = 360 }
     return frame, S, native
 end
 
@@ -36,6 +38,20 @@ spec.describe('window chrome while maximized', function()
         local frame, _, native = fixture()
         spec.equal(frame(960, 700), true)
         spec.equal(native.resized, 1)
+    end)
+    spec.it('resizes from OS bounds with scaled minimums while hit testing stays logical', function()
+        local frame, S, native = fixture()
+        S.win_grab=nil
+        S.display={window_width=1200, window_height=900, window_scale_x=1.5, window_scale_y=1.5}
+        native.mx,native.my=799,599
+        native.sx,native.sy=1000,800
+        spec.truthy(frame(800,600))
+        native.sx,native.sy=1030,845
+        spec.truthy(frame(800,600))
+        spec.equal(native.size[1],1230); spec.equal(native.size[2],945)
+        native.sx,native.sy=0,0; frame(800,600)
+        spec.equal(native.size[1],720); spec.equal(native.size[2],540)
+        spec.equal(native.moved,0)
     end)
 end)
 

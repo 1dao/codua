@@ -1,6 +1,37 @@
 -- Rounded surfaces using the bundled runtime's rectangle primitive.
 local M = {}
 
+-- User zoom is independent of monitor resolution. System DPI belongs to the
+-- native renderer; applying it here as well would enlarge the UI twice.
+function M.normalize_scale(value)
+    value = tonumber(value)
+    if not value or value ~= value or value <= 0 or value == math.huge then return 1 end
+    return math.floor(math.max(0.5, math.min(2, value)) * 100 + 0.5) / 100
+end
+
+function M.adapt_display(rg, zoom)
+    -- Older runtime builds retain their existing, unscaled coordinate system.
+    if not rg.display_info or not rg.set_ui_scale then return nil end
+    local info = rg.display_info()
+    local scale = M.normalize_scale(zoom)
+    rg.set_ui_scale(scale) -- also refreshes glyph rasterization after a DPI change
+    local previous = info.ui_scale or 1
+    info.window_scale_x = (info.window_scale_x or previous) / previous * scale
+    info.window_scale_y = (info.window_scale_y or previous) / previous * scale
+    info.ui_scale = scale
+    return info
+end
+
+function M.panel_visibility(width, sidebar, panel, sidebar_width)
+    local show_panel = panel and width >= sidebar_width + 360 or false
+    local show_sidebar = sidebar and width >= (show_panel and 2 or 1) * sidebar_width + 360 or false
+    return show_sidebar, show_panel
+end
+
+function M.composer_height(content_height)
+    return math.max(42, math.min(78, math.floor(content_height * 0.18)))
+end
+
 function M.rounded(rg, x, y, w, h, radius, color)
     local r = math.max(0, math.floor(math.min(radius, w / 2, h / 2)))
     local function rect(rx, ry, rw, rh)

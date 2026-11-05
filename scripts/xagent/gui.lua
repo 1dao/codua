@@ -164,6 +164,7 @@ local S = {
     menu_y = 0,                -- screen y of that menu
     -- theme
     theme = 'soft',
+    ui_scale = 1,
     header_bg = { 30, 30, 38, 255 },
     sidebar_bg = { 26, 26, 32, 255 },
     picking_dir = false,       -- a folder dialog is currently open
@@ -176,6 +177,19 @@ local S = {
     dir_cache = {},            -- abspath -> immediate children, for the @ picker
 }
 
+local function refresh_display()
+    local previous = S.display
+    S.display = surface.adapt_display(raygui, S.ui_scale)
+    local display = S.display
+    if previous and display and (previous.ui_scale ~= display.ui_scale
+        or previous.dpi_x ~= display.dpi_x or previous.dpi_y ~= display.dpi_y) then
+        -- Rerasterized glyphs can have slightly different metrics even when the
+        -- window's logical width stays unchanged after a monitor/DPI change.
+        for _, tab in ipairs(S.tabs) do tab.view:invalidate() end
+        if S.log_view then S.log_view:invalidate() end
+    end
+end
+
 local SIDEBAR_W = 300
 local HEADER_H  = 38               -- top bar (title/status/meter/toggles)
 local TABBAR_H  = 40               -- tab strip below the top bar
@@ -185,6 +199,24 @@ local THEME_FILE = (fs.home():gsub('[/\\]+$', '')) .. '/.xagent/theme'
 -- Last picked working directory, persisted so the NEXT app launch defaults its
 -- initial session to it (mirrors how THEME_FILE persists the color theme).
 local CWD_FILE   = (fs.home():gsub('[/\\]+$', '')) .. '/.xagent/cwd'
+local UI_SCALE_FILE = (fs.home():gsub('[/\\]+$', '')) .. '/.xagent/ui_scale'
+
+local function set_ui_scale(value)
+    local scale = surface.normalize_scale(value)
+    if scale == S.ui_scale then return true end
+    fs.mkdirp(UI_SCALE_FILE:match('^(.*)/'))
+    local ok, err = fs.write_file(UI_SCALE_FILE, string.format('%.2f\n', scale))
+    if not ok then
+        S.scale_error = '无法保存界面缩放：' .. tostring(err)
+        local tab = S.tabs[S.active]
+        if tab then tab.status = S.scale_error end
+        return false
+    end
+    -- Apply on the next frame, before layout/input, so a button cannot change
+    -- coordinates halfway through drawing. Other open menus have old anchors.
+    S.ui_scale, S.scale_error, S.dd_open = scale, nil, nil
+    return true
+end
 
 -- ── color helpers ──────────────────────────────────────────────────────────
 local function unpack_color(v)
@@ -1600,7 +1632,7 @@ local PANEL_MENU = {
     { mode = 'model',      label = '模型设置' },
     { mode = 'mcp',        label = '工具与 MCP' },
     { mode = 'apilog',     label = 'API 请求记录' },
-    { mode = 'appearance', label = '外观配色' },
+    { mode = 'appearance', label = '外观设置' },
 }
 
 -- A dropdown trigger: a button + a caret. Records its anchor while open so the
@@ -2402,10 +2434,10 @@ local function window_chrome(W, H)
             raygui.set_window_pos(g.wx + dx, g.wy + dy)
         else
             local x, y, w, h = g.wx, g.wy, g.ww, g.wh
-            if g.mode:find('e') then w = math.max(MIN_W, g.ww + dx) end
-            if g.mode:find('s') then h = math.max(MIN_H, g.wh + dy) end
-            if g.mode:find('w') then w = math.max(MIN_W, g.ww - dx); x = g.wx + g.ww - w end
-            if g.mode:find('n') then h = math.max(MIN_H, g.wh - dy); y = g.wy + g.wh - h end
+            if g.mode:find('e') then w = math.max(g.min_w, g.ww + dx) end
+            if g.mode:find('s') then h = math.max(g.min_h, g.wh + dy) end
+            if g.mode:find('w') then w = math.max(g.min_w, g.ww - dx); x = g.wx + g.ww - w end
+            if g.mode:find('n') then h = math.max(g.min_h, g.wh - dy); y = g.wy + g.wh - h end
             raygui.set_window_size(w, h)
             if x ~= g.wx or y ~= g.wy then raygui.set_window_pos(x, y) end
         end
@@ -2420,7 +2452,11 @@ local function window_chrome(W, H)
     local function grab(mode)
         local sx, sy = raygui.mouse_screen()
         local wx, wy = raygui.window_pos()
-        S.win_grab = { mode = mode, sx = sx, sy = sy, wx = wx, wy = wy, ww = W, wh = H }
+        local display = S.display or {}
+        S.win_grab = { mode = mode, sx = sx, sy = sy, wx = wx, wy = wy,
+            ww = display.window_width or W, wh = display.window_height or H,
+            min_w = MIN_W * (display.window_scale_x or 1),
+            min_h = MIN_H * (display.window_scale_y or 1) }
     end
     if edge ~= '' then
         grab(edge); return true
@@ -2907,6 +2943,21 @@ local function draw_appearance_sidebar(x0)
     local pad = 12
     raygui.label(x0 + pad, TOP + 6, SIDEBAR_W - 2 * pad, 22, '配色方案')
     dropdown_button('theme', x0 + pad, TOP + 30, SIDEBAR_W - 2 * pad, 30, S.theme)
+    local y = TOP + 90
+    raygui.label(x0 + pad, y, SIDEBAR_W - 2 * pad, 24, '界面缩放')
+    if raygui.set_ui_scale and raygui.display_info then
+        if raygui.button(x0 + pad, y + 30, 36, 30, '−') then set_ui_scale(S.ui_scale - 0.1) end
+        raygui.label(x0 + pad + 46, y + 30, 66, 30, string.format('%d%%', math.floor(S.ui_scale * 100 + 0.5)))
+        if raygui.button(x0 + pad + 112, y + 30, 36, 30, '+') then set_ui_scale(S.ui_scale + 0.1) end
+        if raygui.button(x0 + pad + 158, y + 30, 96, 30, '重置') then set_ui_scale(1) end
+        draw_text_col('字体、控件和间距一起缩放', x0 + pad, y + 76, 13, muted_col())
+        draw_text_col('默认 100%，跟随系统 DPI', x0 + pad, y + 98, 13, muted_col())
+        if S.scale_error then
+            raygui.label(x0 + pad, y + 124, SIDEBAR_W - 2 * pad, 48, fit_label(S.scale_error, SIDEBAR_W - 2 * pad, 13))
+        end
+    else
+        raygui.label(x0 + pad, y + 30, SIDEBAR_W - 2 * pad, 30, '当前运行库不支持界面缩放')
+    end
 end
 
 -- ── composer ────────────────────────────────────────────────────────────────
@@ -2984,6 +3035,7 @@ end
 
 local function __init()
     S.profiles = config.load_profiles()
+    S.ui_scale = surface.normalize_scale(fs.read_file(UI_SCALE_FILE))
     assert(xnet.init())
     -- ui_lane reserves one worker outside the shared pool for the folder dialog,
     -- which holds its RPC open for as long as the human takes to answer.
@@ -2995,7 +3047,9 @@ local function __init()
     raygui.init(960, 700, 'xagent', {
         undecorated = S.frameless,
         desktop_maximize = IS_WIN and S.frameless,
+        highdpi = true,
     })
+    refresh_display()
     -- A larger atlas avoids enlarging 16px bitmaps for headings while keeping
     -- the existing font metrics and all UI geometry in logical pixels.
     local charset = preseed_charset()
@@ -3081,6 +3135,7 @@ local function __update()
     local tab = T()
     if not tab then return end
 
+    refresh_display()
     local W, H = raygui.screen_size()
     raygui.begin()
 
@@ -3116,8 +3171,7 @@ local function __update()
     local sb = S.sidebar_bg
     -- Keep the composer usable when panels would leave less than 360px.
     -- Retain the selected pages so resizing wider brings them back.
-    local show_sidebar = S.sidebar and W >= SIDEBAR_W + 360
-    local show_panel = S.panel and W >= (show_sidebar and 2 or 1) * SIDEBAR_W + 360
+    local show_sidebar, show_panel = surface.panel_visibility(W, S.sidebar, S.panel, SIDEBAR_W)
     if show_sidebar then
         lx = SIDEBAR_W
         raygui.draw_rectangle(0, TOP, SIDEBAR_W, H - TOP, sb[1], sb[2], sb[3], sb[4])
@@ -3136,11 +3190,12 @@ local function __update()
 
     -- transcript (right of the sidebar); attachments shrink it a bit more
     local answering = tab.pending_input ~= nil
+    INPUT_H = surface.composer_height(H - TOP)
     local comp_h = INPUT_H + TOOLBAR_H + 36
     local att_h = (#tab.attachments > 0) and 58 or 0
     local question_h = answering and math.min(user_input.height(tab, rx - lx - 16,
         function(s) return raygui.measure_text(s, 16) end), H - TOP - comp_h - att_h - 24) or 0
-    local content_pad = math.min(48, math.max(20, math.floor((rx - lx) * 0.04)))
+    local content_pad = math.min(48, math.max(12, math.floor((rx - lx) * 0.04)))
     local tx, ty = lx + content_pad, TOP + 16
     local tw, th = rx - lx - 2 * content_pad, math.max(0, H - ty - comp_h - question_h - att_h - 12 - (answering and 10 or 0))
     if th > 24 and S.panel == 'apilog' and S.apilog_selected then
@@ -3182,7 +3237,8 @@ local function __update()
     -- has the send/stop button. textbox_multi reads raw keys (not raygui-
     -- locked), so its edit mode is forced off while the directory dialog is open.
     local iy = H - comp_h + 12
-    local composer_x, composer_w = lx + 32, rx - lx - 64
+    local composer_pad = math.min(32, math.max(20, math.floor((rx - lx) * 0.04)))
+    local composer_x, composer_w = lx + composer_pad, rx - lx - 2 * composer_pad
     local card_bg = composer_color()
     local edge = mix(S.view_bg, tab.input_edit and accent_col() or text_col(), tab.input_edit and 0.48 or 0.16)
     surface.rounded(raygui, composer_x - 12, iy - 12, composer_w + 24, INPUT_H + TOOLBAR_H + 24, 16, edge)

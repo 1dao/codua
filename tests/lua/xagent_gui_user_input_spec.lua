@@ -55,5 +55,57 @@ spec.describe('GUI composer while answering questions', function()
     end)
 end)
 
+spec.describe('GUI display transitions', function()
+    spec.it('saves zoom separately from fonts, defers application, and preserves state on save failure', function()
+        local first=assert(source:find('local function set_ui_scale(value)',1,true))
+        local last=assert(source:find('local function unpack_color',first,true))
+        local saved, fail_write
+        local state={ui_scale=1, tabs={{}}, active=1, dd_open='menu'}
+        local env=setmetatable({S=state,UI_SCALE_FILE='/home/test/.xagent/ui_scale',
+            surface=require('xagent.ui.surface'),fs={
+                mkdirp=function(path) spec.equal(path,'/home/test/.xagent') end,
+                write_file=function(path,data)
+                    spec.equal(path,'/home/test/.xagent/ui_scale')
+                    if fail_write then return nil,'read only' end
+                    saved=data; return true
+                end,
+            },
+        },{__index=_G})
+        local set_zoom=assert(load(source:sub(first,last-1)..'\nreturn set_ui_scale','@zoom','t',env))()
+        spec.truthy(set_zoom(0.8))
+        spec.equal(state.ui_scale,0.8)
+        spec.equal(require('xagent.ui.surface').normalize_scale(saved),0.8)
+        spec.nil_value(state.display) -- native application waits for refresh_display
+        spec.nil_value(state.dd_open)
+        fail_write=true
+        spec.equal(set_zoom(0.7),false)
+        spec.equal(state.ui_scale,0.8)
+        spec.contains(state.tabs[1].status,'read only')
+        fail_write=false
+        spec.truthy(set_zoom(1))
+        spec.equal(saved,'1.00\n')
+        spec.nil_value(state.scale_error)
+    end)
+    spec.it('invalidates transcript metrics only when scale or DPI changes', function()
+        local first = assert(source:find('local function refresh_display()', 1, true))
+        local last = assert(source:find('local SIDEBAR_W', first, true))
+        local invalidated, display = 0, {ui_scale=1, dpi_x=1, dpi_y=1}
+        local view = {invalidate=function() invalidated=invalidated+1 end}
+        local state = {tabs={{view=view}, {view=view}}, log_view=view}
+        local env = setmetatable({S=state, raygui={}, surface={
+            adapt_display=function() return display end,
+        }}, {__index=_G})
+        local refresh = assert(load(source:sub(first, last-1) .. '\nreturn refresh_display', '@display', 't', env))()
+        refresh()
+        spec.equal(invalidated, 0)
+        display={ui_scale=1, dpi_x=1, dpi_y=1}; refresh()
+        spec.equal(invalidated, 0)
+        display={ui_scale=1, dpi_x=2, dpi_y=2}; refresh()
+        spec.equal(invalidated, 3)
+        display={ui_scale=0.85, dpi_x=2, dpi_y=2}; refresh()
+        spec.equal(invalidated, 6)
+    end)
+end)
+
 local failed = spec.finish()
 return { __init = function() if failed > 0 then os.exit(1) end; xthread.stop(0) end }
