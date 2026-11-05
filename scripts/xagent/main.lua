@@ -19,6 +19,7 @@ local xproxy      = dofile('scripts/core/share/xproxy.lua')
 local registry    = require('xagent.tools.registry')
 local loop        = require('xagent.core.loop')
 local system_prompt = require('xagent.context.system_prompt')
+local project_md = require('xagent.context.project_md')
 local subprocess  = require('xagent.proc.subprocess')
 local mcp         = require('xagent.mcp.bootstrap')
 
@@ -173,6 +174,7 @@ local function __init()
             end
         end
         local sys = system_prompt.build({ cwd = cwd,
+            project_md = project_md.load(cwd), learned_memory = project_md.load_memory(cwd),
             mcp_instructions = require('xagent.mcp.registry').instructions() })
         local rem = skills.reminder()
         if rem ~= '' then sys = sys .. '\n\n' .. rem end

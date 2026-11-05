@@ -502,6 +502,7 @@ local mcp_config = require('xagent.mcp.config')
 -- instructions of whichever MCP servers are connected right now.
 local function build_system(cwd)
     return system_prompt.build({ cwd = cwd, project_md = project_md.load(cwd),
+        learned_memory = project_md.load_memory(cwd),
         mcp_instructions = mcp_registry.instructions() })
 end
 
@@ -3055,7 +3056,7 @@ local function __init()
     new_tab(S.profiles[1], cwd)
     local pmd = project_md.load(cwd)
     if pmd and T().cfg.api_key and T().cfg.api_key ~= '' then
-        add(T(), 'system', '（已加载 project memory）')
+        add(T(), 'system', '（已加载项目指令）')
     end
     S.started = true
 
