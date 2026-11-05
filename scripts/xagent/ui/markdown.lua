@@ -8,6 +8,7 @@
 -- The active GUI theme supplies the palette for both light and dark surfaces.
 
 local xtext = dofile('scripts/core/share/xtext.lua')
+local source = require('xagent.ui.source_highlighter')
 
 local M = {}
 
@@ -22,6 +23,46 @@ M.palette = {
 }
 M.code_bg = { 34, 36, 42, 255 }
 
+-- Expand tabs before lexing so wrapping and byte spans use identical text.
+local function code_row(block, line, number)
+    block.lines[#block.lines + 1] = line
+    return { text = line:gsub('\t', '    '), color = M.palette.code, bg = M.code_bg,
+        code = block, code_start = #block.lines == 1, number = number }
+end
+
+local function highlight(out)
+    local blocks = {}
+    for _, row in ipairs(out) do
+        if row.code then
+            local rows = blocks[row.code] or {}
+            blocks[row.code] = rows
+            rows[#rows + 1] = row
+        end
+    end
+    for block, rows in pairs(blocks) do
+        local lang = source.fence(block.language)
+        local lines = {}
+        for i, row in ipairs(rows) do lines[i] = row.text end
+        local tokens = not block.per_line and source.tokenize(table.concat(lines, '\n'), lang) or {}
+        local offset, cursor = 0, 1
+        for _, row in ipairs(rows) do
+            row.syntax = {}
+            local current = tokens
+            if block.per_line then current = source.tokenize(row.text, lang); offset, cursor = 0, 1 end
+            while current[cursor] and current[cursor].last <= offset do cursor = cursor + 1 end
+            local j = cursor
+            while current[j] and current[j].first <= offset + #row.text do
+                local token = current[j]
+                row.syntax[#row.syntax + 1] = { first = math.max(1, token.first - offset),
+                    last = math.min(#row.text, token.last - offset), kind = token.kind }
+                j = j + 1
+            end
+            offset = offset + #row.text + 1
+        end
+    end
+    return out
+end
+
 -- Strip inline markup down to its visible text.
 local function strip_inline(s)
     s = s:gsub('%[(.-)%]%((.-)%)', '%1')   -- [text](url) -> text
@@ -32,19 +73,35 @@ local function strip_inline(s)
 end
 
 local function styled(s, color)
-    local parts, spans, pos, length = {}, {}, 1, 0
-    while pos <= #s do
-        local a, b, content = s:find('%*%*(.-)%*%*', pos)
-        local ua, ub, uc = s:find('__(.-)__', pos)
-        if ua and (not a or ua < a) then a, b, content = ua, ub, uc end
-        local plain = strip_inline(a and s:sub(pos, a - 1) or s:sub(pos))
-        parts[#parts + 1], length = plain, length + #plain
-        if not a then break end
-        content = strip_inline(content)
-        spans[#spans + 1] = { first = length + 1, last = length + #content }
-        parts[#parts + 1], length, pos = content, length + #content, b + 1
+    local parts, spans, syntax, length = {}, {}, {}, 0
+    local function append(value)
+        parts[#parts + 1], length = value, length + #value
     end
-    return { text = table.concat(parts), color = color, bold_spans = spans }
+    local function parse(fragment, depth)
+        if depth >= 8 then append(fragment); return end
+        local pos = 1
+        while pos <= #fragment do
+            local a, b, content = fragment:find('%*%*(.-)%*%*', pos)
+            local kind = 'bold'
+            local ua, ub, uc = fragment:find('__(.-)__', pos)
+            if ua and (not a or ua < a) then a, b, content = ua, ub, uc end
+            local ca, cb, cc = fragment:find('`([^`]*)`', pos)
+            if ca and (not a or ca < a) then a, b, content, kind = ca, cb, cc, 'code' end
+            append(a and fragment:sub(pos, a - 1) or fragment:sub(pos))
+            if not a then break end
+            local first = length + 1
+            if kind == 'code' then
+                append(content)
+                syntax[#syntax + 1] = { first = first, last = length, kind = 'string' }
+            else
+                parse(content, depth + 1)
+                spans[#spans + 1] = { first = first, last = length }
+            end
+            pos = b + 1
+        end
+    end
+    parse(s:gsub('%[(.-)%]%((.-)%)', '%1'), 0)
+    return { text = table.concat(parts), color = color, bold_spans = spans, syntax = syntax }
 end
 
 local function classify(line, P)
@@ -90,20 +147,68 @@ function M.render(text)
     local in_code = false
     local block
     for _, line in ipairs(xtext.split_lines(text)) do
-        if line:match('^%s*```') then
-            in_code = not in_code
-            if in_code then
-                block = { language = line:match('^%s*```%s*(%S*)') or '', lines = {} }
-            end
+        local fence, info = line:match('^%s*(```+)%s*(.*)$')
+        if not fence then fence, info = line:match('^%s*(~~~+)%s*(.*)$') end
+        if fence and not in_code then
+            in_code = true
+            block = { language = info, lines = {}, fence = fence }
+        elseif in_code and fence and fence:sub(1, 1) == block.fence:sub(1, 1)
+            and #fence >= #block.fence and info == '' then
+            in_code = false
         elseif in_code then
-            block.lines[#block.lines + 1] = line
-            out[#out + 1] = { text = line, color = P.code, bg = M.code_bg,
-                code = block, code_start = #block.lines == 1 }
+            out[#out + 1] = code_row(block, line)
         else
             out[#out + 1] = classify(line, P)
         end
     end
-    return out
+    return highlight(out)
+end
+
+-- Recognize only the listing formats emitted by CodeExplore, Read and Grep.
+-- Prose stays literal, including unknown paths and Markdown-looking source.
+function M.render_tool(text, color)
+    local out, block, mode = {}, nil, nil
+    local explore = text:find('Source below is verbatim with line numbers', 1, true)
+    local function finish()
+        if block and #block.lines == 0 then out[#out + 1] = { text = block.title, color = color } end
+        block = nil
+    end
+    local function start(title, path, kind)
+        local lang = source.language(path)
+        if not lang then return false end
+        block = { title = title, language = lang.name, lines = {}, per_line = kind == 'grep', path = path }
+        mode = kind
+        return true
+    end
+    for _, line in ipairs(xtext.split_lines(text)) do
+        local number, code = line:match('^ *(%d+)\t(.*)$')
+        local path, hit, body = line:match('^(.-):(%d+):(.*)$')
+        if block and mode == 'read' and not number then finish() end
+        if block and mode == 'grep' and path ~= block.path then finish() end
+        local heading = explore and line:match('^## (.*)$')
+        if heading then
+            finish()
+            if not start(heading, heading, 'explore') then
+                out[#out + 1] = { text = line, color = color }
+            end
+        elseif block and mode == 'explore' then
+            if line ~= '' then out[#out + 1] = code_row(block, code or line:gsub('^\t+', ''), number or '') end
+        elseif block and mode == 'read' then
+            out[#out + 1] = code_row(block, code, number)
+        elseif block and mode == 'grep' then
+            out[#out + 1] = code_row(block, body, hit)
+        else
+            local read_path = line:match('^(.*) %(lines %d+%-%d+ of %d+%)$') or line:match('^(.*) %(%d+ lines%)$')
+            if read_path and start(line, read_path, 'read') then
+                -- Header is drawn by the first source row.
+            elseif path and start(path, path, 'grep') then
+                out[#out + 1] = code_row(block, body, hit)
+            else out[#out + 1] = { text = line, color = color } end
+        end
+    end
+    -- Preserve empty Read results rather than swallowing their header.
+    finish()
+    return highlight(out)
 end
 
 M.strip_inline = strip_inline   -- exposed for tests

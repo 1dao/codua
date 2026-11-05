@@ -11,6 +11,7 @@ local globm = dofile('scripts/core/share/xglob.lua')
 local path = dofile('scripts/core/share/xpath.lua')
 local transcript = require('xagent.ui.transcript')   -- M.wrap is pure (no raygui)
 local markdown = require('xagent.ui.markdown')
+local highlighter = require('xagent.ui.source_highlighter')
 local text = dofile('scripts/core/share/xtext.lua')
 
 spec.describe('edit_core.apply_edit', function()
@@ -203,6 +204,17 @@ spec.describe('markdown', function()
         spec.truthy(markdown.render('## 标题')[1].bold)
     end)
 
+    spec.it('colors inline code while keeping bold byte ranges and visible text', function()
+        local row = markdown.render('使用 `local x` 和 **粗体 `代码`**')[1]
+        spec.equal(row.text, '使用 local x 和 粗体 代码')
+        spec.equal(row.text:sub(row.syntax[1].first, row.syntax[1].last), 'local x')
+        spec.equal(row.text:sub(row.syntax[2].first, row.syntax[2].last), '代码')
+        spec.equal(row.text:sub(row.bold_spans[1].first, row.bold_spans[1].last), '粗体 代码')
+        row = markdown.render('`**literal**`')[1]
+        spec.equal(row.text, '**literal**')
+        spec.equal(#row.bold_spans, 0)
+    end)
+
     spec.it('turns list markers into bullets', function()
         local out = markdown.render('- first\n- second')
         spec.equal(out[1].text, '• first')
@@ -241,7 +253,7 @@ spec.describe('markdown', function()
     end)
 
     spec.it('draws message gaps and blank code rows and copies the unwrapped code', function()
-        local rg, copied = {}, nil
+        local rg, copied, painted = {}, nil, {}
         for i, key in ipairs({'BUTTON','BORDER_WIDTH','BASE_COLOR_NORMAL','BASE_COLOR_FOCUSED',
             'BASE_COLOR_PRESSED','TEXT_COLOR_NORMAL','TEXT_COLOR_FOCUSED','TEXT_COLOR_PRESSED'}) do rg[key]=i end
         rg.get_style=function() return 0 end
@@ -252,12 +264,154 @@ spec.describe('markdown', function()
         rg.draw_rectangle=function() end
         rg.begin_scissor=function() end
         rg.end_scissor=function() end
-        rg.draw_text=function(_,_,_,_,red) spec.truthy(red) end
+        rg.draw_text=function(value,_,_,_,red) spec.truthy(red); painted[value] = red end
         rg.button=function(_,_,_,_,label) return label == '复制' end
         local view=transcript.new_view({raygui=rg})
         view.on_copy=function(entry) copied=entry.text end
         view:draw({{role='user',text='问题'}, {role='assistant',text='```lua\n  x =  1\n\n```\n\n结束'}},0,0,300,500)
         spec.equal(copied, '  x =  1\n')
+        view:invalidate()
+        view:draw({{role='tool_result',text='a.lua (1 lines)\n7\tlocal x = "中文"'}},0,0,300,500)
+        spec.equal(copied, 'local x = "中文"')
+        spec.truthy(painted['7'])
+        spec.equal(painted['local'], highlighter.color('keyword', markdown.code_bg)[1])
+        spec.equal(painted['"中文"'], highlighter.color('string', markdown.code_bg)[1])
+    end)
+end)
+
+spec.describe('source highlighting', function()
+    local function has(tokens, kind, source, fragment)
+        for _, token in ipairs(tokens) do
+            if token.kind == kind and source:sub(token.first, token.last) == fragment then return true end
+        end
+        return false
+    end
+
+    spec.it('recognizes mobile language paths and fence aliases', function()
+        for _, path in ipairs({'a.lua','a.h','a.hpp','a.py','a.java','a.kt','a.go','a.jsx',
+            'a.tsx','a.ets','a.html','a.svg','a.md','a.sh','a.cmd','Makefile','a.mk'}) do
+            spec.truthy(highlighter.language(path), path)
+        end
+        spec.equal(highlighter.language('C:\\src\\a.lua (outline)').name, 'Lua')
+        spec.equal(highlighter.fence('python3 title=x').name, 'Python')
+        spec.equal(highlighter.fence('{.cpp}').name, 'C++')
+        spec.equal(highlighter.language('a.unknown'), nil)
+    end)
+
+    spec.it('lexes keywords strings numbers functions and multiline Lua comments', function()
+        local s = 'local x = 42\nprint("中文 -- text") --[=[\nreturn 9\n]=]\nreturn x'
+        local t = highlighter.tokenize(s, highlighter.fence('lua'))
+        spec.truthy(has(t, 'keyword', s, 'local'))
+        spec.truthy(has(t, 'number', s, '42'))
+        spec.truthy(has(t, 'string', s, '"中文 -- text"'))
+        spec.truthy(has(t, 'comment', s, '--[=[\nreturn 9\n]=]'))
+        spec.truthy(has(t, 'keyword', s, 'return'))
+        for i = 2, #t do spec.truthy(t[i].first > t[i-1].last) end
+    end)
+
+    spec.it('keeps triple and raw strings across lines', function()
+        local s = 'x = """one\nreturn 1\n"""\nreturn x'
+        spec.truthy(has(highlighter.tokenize(s, highlighter.fence('py')), 'string', s, '"""one\nreturn 1\n"""'))
+        s = 'var x = `a\\`\nreturn x'
+        spec.truthy(has(highlighter.tokenize(s, highlighter.fence('go')), 'string', s, '`a\\`'))
+    end)
+
+    spec.it('highlights embedded JavaScript and Markdown fenced source', function()
+        local s = '<script>const x = 42;</script>'
+        spec.truthy(has(highlighter.tokenize(s, highlighter.fence('html')), 'keyword', s, 'const'))
+        s = '# heading\n```lua\nlocal x = 1\n```\nUse `code`'
+        local tokens = highlighter.tokenize(s, highlighter.fence('md'))
+        spec.truthy(has(tokens, 'keyword', s, 'local'))
+        spec.truthy(has(tokens, 'string', s, '`code`'))
+        for i = 2, #tokens do spec.truthy(tokens[i].first > tokens[i-1].last) end
+    end)
+
+    spec.it('colors markup shell variables and batch comments', function()
+        local s = '<!-- note --><b title="中文">ok</b>'
+        local t = highlighter.tokenize(s, highlighter.fence('html'))
+        spec.truthy(has(t, 'comment', s, '<!-- note -->'))
+        spec.truthy(has(t, 'tag', s, '<b'))
+        spec.truthy(has(t, 'attribute', s, 'title'))
+        s = 'echo ${HOME}'
+        spec.truthy(has(highlighter.tokenize(s, highlighter.fence('sh')), 'constant', s, '${HOME}'))
+        s = '@REM note\nIF x EQU y echo %PATH%'
+        t = highlighter.tokenize(s, highlighter.fence('cmd'))
+        spec.truthy(has(t, 'comment', s, '@REM note'))
+        spec.truthy(has(t, 'keyword', s, 'IF'))
+        spec.truthy(has(t, 'constant', s, '%PATH%'))
+    end)
+
+    spec.it('leaves unknown and oversized code literal and selects readable palettes', function()
+        spec.equal(#highlighter.tokenize('return 1', nil), 0)
+        spec.equal(#highlighter.tokenize(string.rep('x', 200001), highlighter.fence('lua')), 0)
+        spec.truthy(highlighter.color('keyword', {255,255,255})[1] < highlighter.color('keyword', {0,0,0})[1])
+        local nested = string.rep('```md\n', 100) .. 'text'
+        spec.truthy(type(highlighter.tokenize(nested, highlighter.fence('md'))) == 'table')
+    end)
+
+    spec.it('highlights fenced code across lines without treating embedded fences as closers', function()
+        local rows = markdown.render('~~~~lua\n--[[\nreturn x\n]]\n```\nreturn 1\n~~~~')
+        spec.equal(rows[2].syntax[1].kind, 'comment')
+        spec.equal(rows[4].text, '```')
+        spec.equal(rows[5].syntax[1].kind, 'keyword')
+    end)
+
+    spec.it('recognizes CodeExplore listings and retains elisions and following prose', function()
+        local rows = markdown.render_tool('Source below is verbatim with line numbers\n\n## src/a.lua\n10\tlocal x = 1\n\t... (omitted)\n12\treturn x\n\n## Callers / callees\nnone', {})
+        local listed = {}
+        for _, row in ipairs(rows) do if row.code then listed[#listed+1] = row end end
+        spec.equal(#listed, 3)
+        spec.equal(listed[1].code.title, 'src/a.lua')
+        spec.equal(listed[1].number, '10')
+        spec.equal(listed[2].number, '')
+        spec.equal(listed[3].syntax[1].kind, 'keyword')
+        spec.equal(rows[#rows].text, 'none')
+    end)
+
+    spec.it('recognizes Read ranges and preserves empty results and footers', function()
+        local rows = markdown.render_tool('C:\\src\\a.py (lines 8-9 of 20)\n 8\tdef f():\n 9\t    return "中文"\n\n[Showing lines 8-9]', {})
+        spec.equal(rows[1].number, '8')
+        spec.equal(rows[2].text, '    return "中文"')
+        spec.equal(rows[#rows].text, '[Showing lines 8-9]')
+        rows = markdown.render_tool('a.lua (0 lines)\n(empty file)', {})
+        spec.equal(rows[1].text, 'a.lua (0 lines)')
+        spec.equal(rows[2].text, '(empty file)')
+    end)
+
+    spec.it('isolates unrelated Grep lines and switches files including Windows paths', function()
+        local rows = markdown.render_tool('C:\\src\\a.c:3:/* open\nC:\\src\\a.c:90:return 1;\na.py:2:return 2', {})
+        spec.equal(rows[1].number, '3')
+        spec.equal(rows[2].syntax[1].kind, 'keyword')
+        spec.equal(rows[3].code.title, 'a.py')
+        spec.truthy(rows[3].code_start)
+    end)
+
+    spec.it('keeps unsupported tool output and user Markdown literal', function()
+        local s = '## not a listing\na.xyz:2:**value**'
+        local rows = markdown.render_tool(s, {})
+        spec.equal(rows[1].text, '## not a listing')
+        spec.equal(rows[2].text, 'a.xyz:2:**value**')
+        local view = transcript.new_view({raygui={}})
+        spec.equal(view:logical_lines({role='user',text='**literal**'})[1].text, '**literal**')
+    end)
+
+    spec.it('keeps tab and UTF-8 spans aligned after wrapping with a line-number gutter', function()
+        local view = transcript.new_view({raygui={measure_text=function(s) return utf8.len(s)*10 end}})
+        local rows = view:entry_rows({role='tool_result',text='a.lua (1 lines)\n1\t\tlocal s = "中文"'}, 150)
+        local combined, colored, count = {}, {}, 0
+        for i = 2, #rows do
+            local row = rows[i]
+            combined[#combined+1] = row.text
+            if row.number then count = count + 1 end
+            for _, span in ipairs(row.syntax) do
+                local value = row.text:sub(span.first, span.last)
+                spec.truthy(utf8.len(value))
+                if span.kind == 'string' then colored[#colored+1] = value end
+            end
+        end
+        spec.equal(table.concat(combined), '    local s = "中文"')
+        spec.equal(table.concat(colored), '"中文"')
+        spec.equal(count, 1)
     end)
 end)
 

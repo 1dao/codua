@@ -5,6 +5,7 @@
 
 local emoji = require('xagent.ui.emoji')
 local markdown = require('xagent.ui.markdown')
+local source = require('xagent.ui.source_highlighter')
 local surface = require('xagent.ui.surface')
 
 local M = {}
@@ -152,6 +153,8 @@ end
 function View:logical_lines(entry)
     if entry.role == 'assistant' then
         return markdown.render(entry.text)
+    elseif entry.role == 'tool_result' then
+        return markdown.render_tool(entry.text, role_color(entry.role))
     end
     return { { text = entry.text, color = entry.role == 'user' and markdown.palette.text or role_color(entry.role) } }
 end
@@ -194,30 +197,37 @@ function View:entry_rows(entry, width)
         else
             table_header = true
             if ll.code_start then
-                rows[#rows + 1] = { text = ll.code.language ~= '' and ll.code.language or '代码',
+                rows[#rows + 1] = { text = ll.code.title or (ll.code.language ~= '' and ll.code.language or '代码'),
                     color = M.card_colors.label, bg = ll.bg, code_header = ll.code, entry = entry }
             end
             local wrapped
+            local gutter = ll.number and math.min(width * .3, measure('000000') + 12) or 0
             if ll.code then
                 -- Code whitespace is significant. The prose word wrapper collapses
                 -- indentation and repeated spaces, so wrap code by UTF-8 character.
                 wrapped = {}
-                local tail = break_long(ll.text:gsub('\t', '    '), math.max(1, width - 16), '', 0, measure, spacing, wrapped)
+                local tail = break_long(ll.text, math.max(1, width - 16 - gutter), '', 0, measure, spacing, wrapped)
                 wrapped[#wrapped + 1] = tail
             else
                 wrapped = M.wrap(ll.text, math.max(1, width), measure, spacing)
             end
             local offset = 1
-            for _, sl in ipairs(wrapped) do
+            for part, sl in ipairs(wrapped) do
                 local first = ll.text:find(sl, offset, true) or offset
                 local bold_spans = {}
                 for _, span in ipairs(ll.bold_spans or {}) do
                     local a, b = math.max(first, span.first), math.min(first + #sl - 1, span.last)
                     if a <= b then bold_spans[#bold_spans + 1] = { first = a - first + 1, last = b - first + 1 } end
                 end
+                local syntax = {}
+                for _, span in ipairs(ll.syntax or {}) do
+                    local a, b = math.max(first, span.first), math.min(first + #sl - 1, span.last)
+                    if a <= b then syntax[#syntax + 1] = { first = a - first + 1, last = b - first + 1, kind = span.kind } end
+                end
                 offset = first + #sl
                 rows[#rows + 1] = { text = sl, color = ll.color, bg = ll.bg,
-                    bold = ll.bold, bold_spans = bold_spans, code = ll.code, entry = entry }
+                    bold = ll.bold, bold_spans = bold_spans, syntax = syntax,
+                    number = part == 1 and ll.number or nil, gutter = gutter, code = ll.code, entry = entry }
             end
         end
     end
@@ -492,7 +502,21 @@ function View:draw(entries, x, y, w, h)
                     self.on_copy({ text = table.concat(r.code_header.lines, '\n'), role = 'assistant' })
                 end
             else
-                self:draw_line(r.text, draw_x, ly, r.color)
+                if r.number and r.number ~= '' then
+                    self:draw_line(r.number, draw_x, ly, markdown.palette.quote)
+                end
+                draw_x = draw_x + (r.gutter or 0)
+                if r.syntax and #r.syntax > 0 then
+                    local at = 1
+                    for _, span in ipairs(r.syntax) do
+                        if span.first > at then self:draw_line(r.text:sub(at, span.first - 1),
+                            draw_x + measure(r.text:sub(1, at - 1)), ly, r.color) end
+                        self:draw_line(r.text:sub(span.first, span.last),
+                            draw_x + measure(r.text:sub(1, span.first - 1)), ly, source.color(span.kind, r.bg or self.bg))
+                        at = span.last + 1
+                    end
+                    if at <= #r.text then self:draw_line(r.text:sub(at), draw_x + measure(r.text:sub(1, at - 1)), ly, r.color) end
+                else self:draw_line(r.text, draw_x, ly, r.color) end
                 if r.bold then self:draw_line(r.text, draw_x + 0.6, ly, r.color) end
                 if not r.bold then
                     for _, span in ipairs(r.bold_spans or {}) do

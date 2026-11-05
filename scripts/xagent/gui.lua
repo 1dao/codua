@@ -434,7 +434,8 @@ local function on_event(tab, ev)
         flush_tail(tab)
         local c = (ev.result and ev.result.content) or ''
         if type(c) ~= 'string' then c = '[non-text result]' end
-        if #c > 600 then c = c:sub(1, 600) .. '\n  ...' end
+        -- Listings need their file headers and source rows together for syntax
+        -- highlighting; the transcript already virtualizes off-screen rows.
         add(tab, 'tool_result', c)
     elseif ev.type == 'budget' then
         tab.budget = ev.budget
@@ -1290,7 +1291,7 @@ local function apply_theme(name)
 
     markdown.palette = {
         text    = txt,
-        heading = txt,
+        heading = dark and { 120, 175, 255, 255 } or { 35, 91, 171, 255 },
         code    = dark and { 190, 215, 205, 255 } or txt,
         bullet  = txt,
         quote   = muted,
