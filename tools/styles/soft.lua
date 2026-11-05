@@ -15,18 +15,18 @@ function M.apply(raygui)
 
     -- ========== DEFAULT 全局属性 ==========
     -- 亮色清爽基底
-    raygui.set_style(D, raygui.BORDER_COLOR_NORMAL,   0xe8e6e6ff)  -- 浅灰框线
+    raygui.set_style(D, raygui.BORDER_COLOR_NORMAL,   0xd1deddff)  -- 浅灰框线
     raygui.set_style(D, raygui.BASE_COLOR_NORMAL,     0xffffffff)  -- 纯白填充
-    raygui.set_style(D, raygui.TEXT_COLOR_NORMAL,     0x28282bff)  -- 深灰文字（非纯黑，更柔和）
+    raygui.set_style(D, raygui.TEXT_COLOR_NORMAL,     0x203437ff)  -- 深灰文字（非纯黑，更柔和）
 
-    -- 聚焦状态（蓝色主色）
-    raygui.set_style(D, raygui.BORDER_COLOR_FOCUSED,  0x3b82f6ff)  -- 亮蓝高亮边框
-    raygui.set_style(D, raygui.BASE_COLOR_FOCUSED,    0xf2f4f7ff)  -- 浅灰底色
-    raygui.set_style(D, raygui.TEXT_COLOR_FOCUSED,    0x3b82f6ff)  -- 蓝色文字
+    -- 聚焦状态（与手机版一致的青绿色）
+    raygui.set_style(D, raygui.BORDER_COLOR_FOCUSED,  0x126f64ff)  -- 青绿高亮边框
+    raygui.set_style(D, raygui.BASE_COLOR_FOCUSED,    0xe5f0ecff)  -- 浅灰底色
+    raygui.set_style(D, raygui.TEXT_COLOR_FOCUSED,    0x126f64ff)  -- 青绿文字
 
     -- 按下状态
-    raygui.set_style(D, raygui.BORDER_COLOR_PRESSED,  0x2563ebff)  -- 深蓝边框
-    raygui.set_style(D, raygui.BASE_COLOR_PRESSED,    0x3b82f6ff)  -- 蓝色实色填充
+    raygui.set_style(D, raygui.BORDER_COLOR_PRESSED,  0x0e5c53ff)  -- 深青绿边框
+    raygui.set_style(D, raygui.BASE_COLOR_PRESSED,    0x126f64ff)  -- 青绿实色填充
     raygui.set_style(D, raygui.TEXT_COLOR_PRESSED,    0xffffffff)  -- 白字
 
     -- 禁用状态
@@ -39,34 +39,34 @@ function M.apply(raygui)
     raygui.set_style(D, raygui.TEXT_SPACING,          0x00000001)  -- 1px 字间距
     raygui.set_style(D, raygui.TEXT_PADDING,          0x00000008)  -- 8px 内边距
     raygui.set_style(D, raygui.TEXT_LINE_SPACING,     0x0000000a)  -- 10px 行间距
-    raygui.set_style(D, raygui.LINE_COLOR,            0xd5d1d1ff)  -- Group title/separator color
+    raygui.set_style(D, raygui.LINE_COLOR,            0xcdd8d8ff)  -- Group title/separator color
     raygui.set_style(D, raygui.BACKGROUND_COLOR,      0xffffffff)  -- 画布背景（白色）
 
     -- ========== BUTTON 按钮微调 ==========
     raygui.set_style(B, raygui.BASE_COLOR_NORMAL,     0xffffffff)  -- 按钮使用白色底
-    raygui.set_style(B, raygui.BORDER_COLOR_FOCUSED,  0x3b82f6ff)  -- 悬停蓝色边框
-    raygui.set_style(B, raygui.BASE_COLOR_FOCUSED,    0xf2f4f7ff)  -- 悬停浅灰底色
-    raygui.set_style(B, raygui.BASE_COLOR_PRESSED,    0x3b82f6ff)  -- 按下蓝色实心
+    raygui.set_style(B, raygui.BORDER_COLOR_FOCUSED,  0x126f64ff)  -- 悬停青绿边框
+    raygui.set_style(B, raygui.BASE_COLOR_FOCUSED,    0xe5f0ecff)  -- 悬停浅灰底色
+    raygui.set_style(B, raygui.BASE_COLOR_PRESSED,    0x126f64ff)  -- 按下青绿实心
 
     -- ========== SLIDER 滑动条 ==========
     raygui.set_style(S, raygui.BASE_COLOR_NORMAL,     0xf1efefff)
-    raygui.set_style(S, raygui.BASE_COLOR_FOCUSED,    0xe8e6e6ff)
-    raygui.set_style(S, raygui.BASE_COLOR_PRESSED,    0x3b82f6ff)
-    raygui.set_style(S, raygui.TEXT_COLOR_FOCUSED,    0x3b82f6ff)
+    raygui.set_style(S, raygui.BASE_COLOR_FOCUSED,    0xd1deddff)
+    raygui.set_style(S, raygui.BASE_COLOR_PRESSED,    0x126f64ff)
+    raygui.set_style(S, raygui.TEXT_COLOR_FOCUSED,    0x126f64ff)
 
     -- ========== PROGRESSBAR 进度条 ==========
     raygui.set_style(P, raygui.BASE_COLOR_NORMAL,     0xf1efefff)
-    raygui.set_style(P, raygui.BASE_COLOR_FOCUSED,    0x3b82f6ff)
-    raygui.set_style(P, raygui.TEXT_COLOR_FOCUSED,    0x3b82f6ff)
+    raygui.set_style(P, raygui.BASE_COLOR_FOCUSED,    0x126f64ff)
+    raygui.set_style(P, raygui.TEXT_COLOR_FOCUSED,    0x126f64ff)
 
     -- ========== CHECKBOX ==========
-    raygui.set_style(C, raygui.BASE_COLOR_PRESSED,    0x3b82f6ff)
+    raygui.set_style(C, raygui.BASE_COLOR_PRESSED,    0x126f64ff)
     raygui.set_style(C, raygui.TEXT_COLOR_PRESSED,    0xffffffff)
 
     -- ========== TEXTBOX / VALUEBOX ==========
-    raygui.set_style(T, raygui.TEXT_COLOR_FOCUSED,    0x28282bff)
+    raygui.set_style(T, raygui.TEXT_COLOR_FOCUSED,    0x203437ff)
     raygui.set_style(T, raygui.BASE_COLOR_FOCUSED,    0xffffffff)
-    raygui.set_style(V, raygui.TEXT_COLOR_FOCUSED,    0x28282bff)
+    raygui.set_style(V, raygui.TEXT_COLOR_FOCUSED,    0x203437ff)
     raygui.set_style(V, raygui.BASE_COLOR_FOCUSED,    0xffffffff)
 end
 

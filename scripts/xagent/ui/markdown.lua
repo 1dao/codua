@@ -2,12 +2,10 @@
 --
 -- Renders an assistant message into a list of "logical lines", each carrying a
 -- color (and optional background for code blocks). The transcript then wraps and
--- draws each logical line (single color per line keeps wrapping exact and avoids
--- inter-glyph spacing drift). Inline markers (**, `, [..](..)) are stripped so
--- the output reads clean; block elements (#, ```, -, |, ---) are colored.
+-- draws each logical line. Inline markers are removed from visible text;
+-- bold spans, code blocks and table cells retain metadata for the renderer.
 --
--- Palette hues nod to the user's reference screenshot (blue headings, distinct
--- code), adapted for the dark transcript background.
+-- The active GUI theme supplies the palette for both light and dark surfaces.
 
 local xtext = dofile('scripts/core/share/xtext.lua')
 
@@ -33,30 +31,56 @@ local function strip_inline(s)
     return s
 end
 
+local function styled(s, color)
+    local parts, spans, pos, length = {}, {}, 1, 0
+    while pos <= #s do
+        local a, b, content = s:find('%*%*(.-)%*%*', pos)
+        local ua, ub, uc = s:find('__(.-)__', pos)
+        if ua and (not a or ua < a) then a, b, content = ua, ub, uc end
+        local plain = strip_inline(a and s:sub(pos, a - 1) or s:sub(pos))
+        parts[#parts + 1], length = plain, length + #plain
+        if not a then break end
+        content = strip_inline(content)
+        spans[#spans + 1] = { first = length + 1, last = length + #content }
+        parts[#parts + 1], length, pos = content, length + #content, b + 1
+    end
+    return { text = table.concat(parts), color = color, bold_spans = spans }
+end
+
 local function classify(line, P)
     if line == '' then return { text = '', color = P.text } end
 
     local hashes, htext = line:match('^(#+)%s+(.*)$')
-    if hashes then return { text = strip_inline(htext), color = P.heading } end
+    if hashes then
+        local row = styled(htext, P.heading)
+        row.bold = true
+        return row
+    end
 
     if line:match('^%s*[%-%*_]%s*[%-%*_]%s*[%-%*_][%s%-%*_]*$') then
         return { text = string.rep('─', 48), color = P.hr }   -- horizontal rule
     end
 
     local q = line:match('^%s*>%s?(.*)$')
-    if q then return { text = '┃ ' .. strip_inline(q), color = P.quote } end
+    if q then return styled('┃ ' .. q, P.quote) end
 
     local ind, _, rest = line:match('^(%s*)([%-%*%+])%s+(.*)$')
-    if rest then return { text = ind .. '• ' .. strip_inline(rest), color = P.bullet } end
+    if rest then return styled(ind .. '• ' .. rest, P.bullet) end
 
     local ind2, num, rest2 = line:match('^(%s*)(%d+[%.%)])%s+(.*)$')
-    if rest2 then return { text = ind2 .. num .. ' ' .. strip_inline(rest2), color = P.bullet } end
+    if rest2 then return styled(ind2 .. num .. ' ' .. rest2, P.bullet) end
 
     if line:match('^%s*|.*|%s*$') then
-        return { text = line, color = P.table }                -- keep table pipes
+        local cells, separator = {}, true
+        local body = line:match('^%s*|(.*)|%s*$')
+        for cell in (body .. '|'):gmatch('(.-)|') do
+            cells[#cells + 1] = strip_inline(cell:match('^%s*(.-)%s*$'))
+            if not cell:match('^%s*:?-+:?%s*$') then separator = false end
+        end
+        return { text = line, color = P.table, cells = cells, separator = separator }
     end
 
-    return { text = strip_inline(line), color = P.text }
+    return styled(line, P.text)
 end
 
 -- render(text) -> list of { text, color, bg? }
@@ -64,11 +88,17 @@ function M.render(text)
     local P = M.palette
     local out = {}
     local in_code = false
+    local block
     for _, line in ipairs(xtext.split_lines(text)) do
         if line:match('^%s*```') then
-            in_code = not in_code                              -- fence: hidden
+            in_code = not in_code
+            if in_code then
+                block = { language = line:match('^%s*```%s*(%S*)') or '', lines = {} }
+            end
         elseif in_code then
-            out[#out + 1] = { text = line, color = P.code, bg = M.code_bg }
+            block.lines[#block.lines + 1] = line
+            out[#out + 1] = { text = line, color = P.code, bg = M.code_bg,
+                code = block, code_start = #block.lines == 1 }
         else
             out[#out + 1] = classify(line, P)
         end
