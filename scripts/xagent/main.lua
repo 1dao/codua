@@ -174,10 +174,11 @@ local function __init()
             end
         end
         local sys = system_prompt.build({ cwd = cwd,
-            project_md = project_md.load(cwd), learned_memory = project_md.load_memory(cwd),
+            project_md = project_md.load(cwd),
             mcp_instructions = require('xagent.mcp.registry').instructions() })
         local rem = skills.reminder()
         if rem ~= '' then sys = sys .. '\n\n' .. rem end
+        sys = require('xagent.context.memory').prepare(sys, cwd, prompt, cfg)
         local messages = { { role = 'user', content = prompt } }
 
         local via = cfg.proxy and (' via ' .. xproxy.redact(cfg.proxy)) or ''

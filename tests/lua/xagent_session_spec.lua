@@ -199,6 +199,172 @@ spec.describe('separate instructions and learned memory', function()
             spec.contains(memory, '[learned memory truncated]')
         end)
     end)
+
+    spec.it('refreshes retrieved notes across sessions without retaining old request context', function()
+        with_workspace(function()
+            local memory = require('xagent.context.memory')
+            local provider = require('xagent.llm.provider')
+            local compaction = require('xagent.context.compaction')
+            local stream, compact = provider.stream_message, compaction.auto_compact_if_needed
+            local requests, budgets = {}, {}
+            provider.stream_message = function(_, params, cb)
+                requests[#requests + 1] = params.system
+                cb.on_done({message={role='assistant',content={{type='text',text='done'}}},
+                    stop_reason='end_turn',usage={input_tokens=100,output_tokens=2}})
+            end
+            compaction.auto_compact_if_needed = function(opts)
+                budgets[#budgets + 1] = {system=opts.system, usage=opts.usage}
+                return {messages=opts.force and {{role='user',content='This session is being continued: fixture summary.'}} or opts.messages,
+                    did_compact=opts.force or false}
+            end
+            local ok, err = pcall(function()
+                assert(not memory_write.call({name='Rust resolution',content='Rust uses concrete impl scope.'},{cwd=dir}).is_error)
+                assert(not memory_write.call({name='SQLite locking',content='SQLite uses a busy timeout.'},{cwd=dir}).is_error)
+                local s = session.new({cfg={model='fixture'},cwd=dir,system='BASE RULES',tools={}})
+                local function run(value)
+                    value:run()
+                end
+                local function turn(value, query)
+                    value:add_user(query)
+                    local co = coroutine.create(function() run(value) end)
+                    local resumed, failure = coroutine.resume(co)
+                    assert(resumed, failure)
+                    spec.equal(coroutine.status(co), 'dead')
+                end
+                turn(s, 'Rust resolution')
+                spec.contains(requests[1], 'concrete impl scope')
+                spec.nil_value(requests[1]:find('busy timeout',1,true))
+                spec.equal(s.system, 'BASE RULES', 'the base system must not accumulate selected notes')
+                turn(s, 'Rust resolution')
+                spec.truthy(budgets[2].usage, 'unchanged memory retains the usage anchor')
+                turn(s, 'SQLite locking')
+                spec.contains(requests[3], 'busy timeout')
+                spec.nil_value(requests[3]:find('concrete impl scope',1,true))
+                spec.nil_value(budgets[3].usage, 'changed memory invalidates the usage anchor')
+                s:compact()
+                spec.equal(budgets[4].system, requests[3], 'manual compaction uses the effective request system')
+                spec.contains(s.messages[1].content,'fixture summary','the old message history was replaced')
+                turn(s, 'Rust resolution')
+                spec.contains(requests[4], 'concrete impl scope', 'retrieval still runs after compaction')
+                local saved = assert(s:save(dir))
+                local persisted = assert(fs.read_file(saved))
+                spec.nil_value(persisted:find('concrete impl scope',1,true), 'retrieved text must not be persisted')
+                local loaded = assert(session.load(saved,{cfg=s.cfg,system='BASE RULES',tools={}}))
+                os.remove(saved)
+                assert(not memory_write.call({name='Rust diagnostics',content='Rust reports the fresh diagnostic marker.'},{cwd=dir}).is_error)
+                turn(loaded, 'Rust diagnostics')
+                spec.contains(requests[5], 'fresh diagnostic marker', 'resumed sessions read current disk memory')
+                local fresh = session.new({cfg=s.cfg,cwd=dir,system='BASE RULES',tools={}})
+                turn(fresh, 'Rust diagnostics')
+                spec.contains(requests[6], 'fresh diagnostic marker', 'new sessions retrieve the same persisted knowledge')
+                spec.equal(memory.prepare('BASE',dir,'unrelated zebra telescope'), 'BASE')
+            end)
+            provider.stream_message, compaction.auto_compact_if_needed = stream, compact
+            assert(ok, err)
+        end)
+    end)
+
+    spec.it('searches recent notes beyond the scan limit instead of loading an old file prefix', function()
+        with_workspace(function()
+            fs.mkdirp(dir .. '/.xagent/memory')
+            assert(fs.write_file(project_md.memory_path(dir), '## Rust old\n' .. string.rep('padding ',150000) ..
+                '\n## Rust recent\nRecent concrete impl guidance.\n'))
+            local context = require('xagent.context.memory').retrieve(dir,'Rust')
+            spec.contains(context,'Rust recent')
+            spec.nil_value(context:find('Rust old',1,true))
+            spec.truthy(#context <= 4096)
+        end)
+    end)
+end)
+
+spec.describe('offline learned memory retrieval', function()
+    local memory = require('xagent.context.memory')
+
+    spec.it('ranks matching titles ahead of body-only matches and omits unrelated lessons', function()
+        local context, selected = memory.select('## SQLite\nDatabase busy timeout.\n## Rust\nUse impl scope.\n' ..
+            '## Miscellaneous\nA Rust diagnostic.','Rust')
+        spec.equal(selected[1].title,'Rust')
+        spec.equal(#selected,2)
+        spec.contains(context,'source: .xagent/memory/lessons_learned.md')
+        spec.contains(context,'line 3')
+        spec.nil_value(context:find('Database busy timeout',1,true))
+    end)
+
+    spec.it('matches Chinese phrases and code identifiers without a provider', function()
+        local context = memory.select('## 流式响应\n工具参数截断后需要重新发送。\n## 数据库\n配置连接池。',
+            '修复工具参数截断')
+        spec.contains(context,'流式响应')
+        spec.nil_value(context:find('配置连接池',1,true))
+        context = memory.select('## Runtime\nCall parse_response before dispatch.\n## CSS\nUse a grid.',
+            'scripts/llm/parse_response.lua')
+        spec.contains(context,'parse_response')
+        spec.nil_value(context:find('Use a grid',1,true))
+    end)
+
+    spec.it('omits no-match and generic queries rather than injecting a fallback dump', function()
+        local raw = '## Rust\nUse impl scope.'
+        spec.nil_value(memory.select(raw,'SQLite database'))
+        spec.nil_value(memory.select(raw,'please help fix this project'))
+        spec.nil_value(memory.select(raw,''))
+        spec.nil_value(memory.select('', 'Rust'))
+    end)
+
+    spec.it('searches later entries beyond the old 8000-byte loading cap', function()
+        local context = memory.select('## Other\n' .. string.rep('padding ',2000) .. '\n## Rust\nLate Rust lesson.', 'Rust')
+        spec.contains(context,'Late Rust lesson')
+        spec.truthy(#context < 4096)
+    end)
+
+    spec.it('deduplicates exact lessons, limits entries and breaks ties by recency', function()
+        local raw = '## Rust duplicate\nSame Rust lesson.\n## Rust duplicate\nSame Rust lesson.\n'
+        for i=1,6 do raw=raw..'## Rust '..i..'\nUnique lesson '..i..'.\n' end
+        local first, selected = memory.select(raw,'Rust')
+        local second = memory.select(raw,'Rust')
+        spec.equal(first,second)
+        spec.equal(#selected,4)
+        spec.equal(selected[1].title,'Rust 6')
+        local _, duplicate = memory.select('## Rust\nSame lesson.\n## Rust\nSame lesson.','Rust')
+        spec.equal(#duplicate,1)
+        spec.equal(duplicate[1].line,3)
+    end)
+
+    spec.it('keeps a matching passage within the total UTF-8 byte budget', function()
+        local raw='## 运行时\n'..string.rep('无关介绍。',200)..'Rust 关键经验：保留具体实现作用域。'..string.rep('结束。',100)
+        local context = memory.select(raw,'Rust',{max_bytes=700})
+        spec.truthy(#context<=700)
+        spec.truthy(utf8.len(context),'truncation must preserve UTF-8')
+        spec.contains(context,'Rust 关键经验')
+        spec.contains(context,'must not override explicit user requests')
+        spec.nil_value(memory.select(raw,'Rust',{max_bytes=100}))
+    end)
+
+    spec.it('does not treat headings inside fenced examples as separate lessons', function()
+        local _, selected = memory.select('## Markdown\n```md\n## Rust example\n```\nRust documentation.','Rust')
+        spec.equal(#selected,1)
+        spec.equal(selected[1].title,'Markdown')
+    end)
+
+    spec.it('builds queries from actual user text, excluding tool output and reminders', function()
+        local query = memory.query({{role='user',content='old SQLite task'},
+            {role='user',content={{type='text',text='Rust scope'}, {type='image',source={}},
+                {type='text',text='<system-reminder>SQLite skills</system-reminder>'}}},
+            {role='user',content={{type='tool_result',content='SQLite result'}}}})
+        spec.equal(query,'Rust scope')
+    end)
+
+    spec.it('omits memory gracefully when reading fails or the context window is too small', function()
+        local retrieve=memory.retrieve
+        memory.retrieve=function() error('fixture read failure') end
+        local ok, system=pcall(memory.prepare,'BASE','.','Rust',{})
+        memory.retrieve=retrieve
+        assert(ok,system)
+        spec.equal(system,'BASE')
+        memory.retrieve=function(_,query,opts) return memory.select('## Rust\nUse concrete scope.',query,opts) end
+        ok, system=pcall(memory.prepare,'BASE','.','Rust',{context_window=1000})
+        memory.retrieve=retrieve
+        assert(ok,system)
+        spec.equal(system,'BASE','small windows must not be filled with optional memory')
+    end)
 end)
 
 return {

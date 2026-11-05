@@ -502,7 +502,6 @@ local mcp_config = require('xagent.mcp.config')
 -- instructions of whichever MCP servers are connected right now.
 local function build_system(cwd)
     return system_prompt.build({ cwd = cwd, project_md = project_md.load(cwd),
-        learned_memory = project_md.load_memory(cwd),
         mcp_instructions = mcp_registry.instructions() })
 end
 

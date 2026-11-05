@@ -7,6 +7,7 @@
 
 local loop = require('xagent.core.loop')
 local tokens = require('xagent.context.tokens')
+local memory = require('xagent.context.memory')
 local fs = dofile('scripts/core/share/xfs.lua')
 local xutils = require('xutils')
 
@@ -248,12 +249,17 @@ end
 -- threaded across turns so the token estimate stays cheap and accurate.
 function Session:run(on_event)
     self:ensure_title()
+    local system = memory.prepare(self.system, self.cwd, memory.query(self.transcript), self.cfg)
+    -- Usage anchors describe the entire request, including its selected memory.
+    -- A changed selection invalidates the old input count before compaction.
+    if self.request_system ~= system then self.last_usage, self.usage_anchor_index = nil, nil end
+    self.request_system = system
     self:inject_skills_listing()
 
     local res = loop.run({
         cfg = self.cfg,
         messages = self.messages,
-        system = self.system,
+        system = system,
         tools = self.tools,
         ctx = { cwd = self.cwd, session_id = self.id, confirm = self.confirm, tool_guard = self.tool_guard,
             request_user_input = self.request_user_input },
@@ -285,7 +291,7 @@ function Session:compact(focus, on_event)
     local compaction = require('xagent.context.compaction')
     local res = compaction.auto_compact_if_needed({
         -- Same system + tools as a turn, so the summary reuses the cached prefix.
-        messages = self.messages, cfg = self.cfg, system = self.system, tools = self.tools,
+        messages = self.messages, cfg = self.cfg, system = self.request_system or self.system, tools = self.tools,
         usage = self.last_usage, usage_anchor_index = self.usage_anchor_index,
         focus = focus, force = true,
     })
