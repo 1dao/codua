@@ -175,6 +175,34 @@ spec.describe('markdown', function()
         spec.equal(out[1].color, P.code)
     end)
 
+    spec.it('preserves code indentation and blank lines when wrapping narrow cards', function()
+        local view = transcript.new_view({ font_size = 16,
+            raygui = { measure_text = function(s) return utf8.len(s) * 10 end } })
+        local rows = view:entry_rows({ role = 'assistant',
+            text = '```lua\n    中文 =  1\n\n    return 中文\n```' }, 76)
+        spec.equal(rows[1].text, 'lua')
+        spec.truthy(rows[1].code_header)
+        spec.equal(table.concat(rows[1].code_header.lines, '\n'), '    中文 =  1\n\n    return 中文')
+        local content = {}
+        for i = 2, #rows do content[#content + 1] = rows[i].text end
+        spec.equal(table.concat(content), '    中文 =  1    return 中文')
+        local blank = false
+        for i = 2, #rows do
+            if rows[i].text == '' then blank = true; spec.truthy(rows[i].bg) end
+            spec.truthy(utf8.len(rows[i].text) <= 6)
+        end
+        spec.truthy(blank)
+    end)
+
+    spec.it('keeps streamed code available for copying before its closing fence', function()
+        local rows = markdown.render('```lua\n  local x = 1\n  return x')
+        spec.equal(#rows, 2)
+        spec.truthy(rows[1].code_start)
+        spec.equal(rows[2].code_start, false)
+        spec.equal(table.concat(rows[1].code.lines, '\n'), '  local x = 1\n  return x')
+        spec.truthy(markdown.render('## 标题')[1].bold)
+    end)
+
     spec.it('turns list markers into bullets', function()
         local out = markdown.render('- first\n- second')
         spec.equal(out[1].text, '• first')
@@ -188,6 +216,48 @@ spec.describe('markdown', function()
         spec.equal(out[1].color, P.table)
         spec.equal(out[2].text, 'plain line')
         spec.equal(out[2].color, P.text)
+    end)
+
+    spec.it('wraps table cells into aligned columns and hides separator syntax', function()
+        local view = transcript.new_view({raygui={measure_text=function(s) return utf8.len(s)*10 end}})
+        local rows = view:entry_rows({role='assistant', text='| 约束 | 应对 |\n| --- | --- |\n| 很长的单元格 | 短 |'}, 112)
+        spec.equal(#rows, 3)
+        spec.equal(#rows[1].cells, 2)
+        spec.equal(rows[1].cells[1], '约束')
+        spec.equal(rows[1].table_header, true)
+        spec.equal(rows[2].table_header, false)
+        spec.equal(rows[2].cells[1], '很长的单')
+        spec.equal(rows[3].cells[1], '元格')
+        spec.equal(rows[3].cells[2], '')
+    end)
+
+    spec.it('keeps bold ranges on UTF-8 boundaries across wrapped rows', function()
+        local view = transcript.new_view({raygui={measure_text=function(s) return utf8.len(s)*10 end}})
+        local rows = view:entry_rows({role='assistant',text='**中文标题**内容'}, 30)
+        spec.equal(rows[1].text, '中文标')
+        spec.equal(rows[1].bold_spans[1].first, 1)
+        spec.equal(rows[1].bold_spans[1].last, 9)
+        spec.equal(rows[2].bold_spans[1].last, 3)
+    end)
+
+    spec.it('draws message gaps and blank code rows and copies the unwrapped code', function()
+        local rg, copied = {}, nil
+        for i, key in ipairs({'BUTTON','BORDER_WIDTH','BASE_COLOR_NORMAL','BASE_COLOR_FOCUSED',
+            'BASE_COLOR_PRESSED','TEXT_COLOR_NORMAL','TEXT_COLOR_FOCUSED','TEXT_COLOR_PRESSED'}) do rg[key]=i end
+        rg.get_style=function() return 0 end
+        rg.set_style=function() end
+        rg.measure_text=function(s) return utf8.len(s)*10 end
+        rg.get_mouse=function() return -100,-100 end
+        rg.get_wheel=function() return 0 end
+        rg.draw_rectangle=function() end
+        rg.begin_scissor=function() end
+        rg.end_scissor=function() end
+        rg.draw_text=function(_,_,_,_,red) spec.truthy(red) end
+        rg.button=function(_,_,_,_,label) return label == '复制' end
+        local view=transcript.new_view({raygui=rg})
+        view.on_copy=function(entry) copied=entry.text end
+        view:draw({{role='user',text='问题'}, {role='assistant',text='```lua\n  x =  1\n\n```\n\n结束'}},0,0,300,500)
+        spec.equal(copied, '  x =  1\n')
     end)
 end)
 

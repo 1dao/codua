@@ -5,6 +5,7 @@
 
 local emoji = require('xagent.ui.emoji')
 local markdown = require('xagent.ui.markdown')
+local surface = require('xagent.ui.surface')
 
 local M = {}
 
@@ -86,6 +87,10 @@ local function role_color(role) return M.role_colors[role] or M.role_colors.assi
 -- Clickable links: bare URLs in the text (e.g. a plain http://… address) are
 -- drawn in this color + underlined and open on click.
 M.link_color = { 96, 170, 255, 255 }
+M.card_colors = {
+    user = { 239, 247, 244, 255 }, assistant = { 255, 255, 255, 255 },
+    label = { 18, 111, 100, 255 },
+}
 
 -- find_links(s) -> { { s=byte_start, e=byte_end, url=string }, … } for each
 -- scheme://… run in `s`. URL chars are ASCII, so byte offsets are also valid
@@ -121,8 +126,9 @@ function M.new_view(opts)
         emoji_tex = opts.emoji_tex,   -- atlas texture handle, or nil to disable
         bg = opts.bg or { 24, 24, 28, 255 },
         font_size = fs,
-        line_h = fs + 6,
-        pad = 8,
+        line_h = math.floor(fs * 1.5),
+        pad = 14,
+        cards = not opts.anchor_top,
         scroll = 0,
         -- anchor_top: read top-down, never auto-jump to the bottom (used by the
         -- API-log detail). Default views follow the streaming tail (chat).
@@ -147,7 +153,7 @@ function View:logical_lines(entry)
     if entry.role == 'assistant' then
         return markdown.render(entry.text)
     end
-    return { { text = entry.text, color = role_color(entry.role) } }
+    return { { text = entry.text, color = entry.role == 'user' and markdown.palette.text or role_color(entry.role) } }
 end
 
 -- Drop cached layout (call when colors/theme change so rows re-render).
@@ -156,7 +162,7 @@ function View:invalidate()
     self.layout = nil
 end
 
--- Wrapped visual rows for one entry: { text, color, bg }. Cached by text length.
+-- Wrapped rows retain code, emphasis and table metadata. Cached by text length.
 function View:entry_rows(entry, width)
     local c = self.cache[entry]
     if c and c.width == width and c.len == #entry.text then return c.rows end
@@ -166,9 +172,53 @@ function View:entry_rows(entry, width)
         if self.rg.TEXT_SPACING then spacing = self.rg.get_style(self.rg.DEFAULT, self.rg.TEXT_SPACING) or 0 end
     end)
     local rows = {}
-    for _, ll in ipairs(self:logical_lines(entry)) do
-        for _, sl in ipairs(M.wrap(ll.text, width, measure, spacing)) do
-            rows[#rows + 1] = { text = sl, color = ll.color, bg = ll.bg, entry = entry }
+    local logical = self:logical_lines(entry)
+    local table_header = true
+    for _, ll in ipairs(logical) do
+        if ll.cells then
+            if not ll.separator then
+                local cell_width = width / math.max(1, #ll.cells)
+                local columns, count = {}, 1
+                for col, value in ipairs(ll.cells) do
+                    columns[col] = M.wrap(value, math.max(1, cell_width - 16), measure, spacing)
+                    count = math.max(count, #columns[col])
+                end
+                for line = 1, count do
+                    local cells = {}
+                    for col = 1, #columns do cells[col] = columns[col][line] or '' end
+                    rows[#rows + 1] = { text = '', cells = cells, cell_width = cell_width,
+                        table_header = table_header, color = ll.color, entry = entry }
+                end
+                table_header = false
+            end
+        else
+            table_header = true
+            if ll.code_start then
+                rows[#rows + 1] = { text = ll.code.language ~= '' and ll.code.language or '代码',
+                    color = M.card_colors.label, bg = ll.bg, code_header = ll.code, entry = entry }
+            end
+            local wrapped
+            if ll.code then
+                -- Code whitespace is significant. The prose word wrapper collapses
+                -- indentation and repeated spaces, so wrap code by UTF-8 character.
+                wrapped = {}
+                local tail = break_long(ll.text:gsub('\t', '    '), math.max(1, width - 16), '', 0, measure, spacing, wrapped)
+                wrapped[#wrapped + 1] = tail
+            else
+                wrapped = M.wrap(ll.text, math.max(1, width), measure, spacing)
+            end
+            local offset = 1
+            for _, sl in ipairs(wrapped) do
+                local first = ll.text:find(sl, offset, true) or offset
+                local bold_spans = {}
+                for _, span in ipairs(ll.bold_spans or {}) do
+                    local a, b = math.max(first, span.first), math.min(first + #sl - 1, span.last)
+                    if a <= b then bold_spans[#bold_spans + 1] = { first = a - first + 1, last = b - first + 1 } end
+                end
+                offset = first + #sl
+                rows[#rows + 1] = { text = sl, color = ll.color, bg = ll.bg,
+                    bold = ll.bold, bold_spans = bold_spans, code = ll.code, entry = entry }
+            end
         end
     end
     self.cache[entry] = { width = width, len = #entry.text, rows = rows }
@@ -201,6 +251,10 @@ end
 
 local function entry_block(self, entry, width)
     local block = {}
+    if self.cards and (entry.role == 'user' or entry.role == 'assistant') then
+        block[#block + 1] = { text = entry.role == 'user' and '你' or 'codua',
+            color = M.card_colors.label, label = true, entry = entry }
+    end
     for _, r in ipairs(self:entry_rows(entry, width)) do block[#block + 1] = r end
     -- copy button on any content message (skip the short tool-call cards + system,
     -- and any entry that opted out via no_copy)
@@ -267,7 +321,9 @@ end
 function View:draw(entries, x, y, w, h)
     local rg, pad = self.rg, self.pad
     local SB_W = 8                          -- scrollbar track/thumb width
-    local width = w - pad * 2 - SB_W - 4     -- reserve a right gutter for the bar
+    local inset = self.cards and 14 or 0
+    local width = math.max(1, w - pad * 2 - SB_W - 4 - inset * 2)
+    local text_x = x + pad + inset
     local viewport_h = h - pad * 2
     local visible_rows = math.max(1, math.ceil(viewport_h / self.line_h))
     local l = self:ensure_layout(entries, width)
@@ -365,8 +421,39 @@ function View:draw(entries, x, y, w, h)
     local bg = self.bg
     rg.draw_rectangle(x, y, w, h, bg[1], bg[2], bg[3], bg[4])
     rg.begin_scissor(x + 1, y + 1, w - 2, h - 2)
+    -- Paint whole message surfaces before the rows. Only visible spans are
+    -- visited; rounded ends remain outside the viewport for long messages.
+    if self.cards then
+        local start = math.max(1, math.floor(self.scroll / self.line_h))
+        while start <= total do
+            local row = row_at(start)
+            local top = y + pad + (start - 1) * self.line_h - self.scroll
+            if top > y + h then break end
+            local finish = start
+            if row.entry and M.card_colors[row.entry.role] then
+                local limit = math.ceil((self.scroll + h) / self.line_h) + 1
+                while finish < math.min(total, limit) and row_at(finish + 1).entry == row.entry do finish = finish + 1 end
+                -- When the first row is clipped, hide its artificial top corners.
+                if start > 1 and row_at(start - 1).entry == row.entry then top = top - 16 end
+                local bottom = y + pad + finish * self.line_h - self.scroll
+                surface.rounded(rg, x + pad, top - 10, width + inset * 2, bottom - top + 16,
+                    14, M.card_colors[row.entry.role])
+            end
+            start = finish + 1
+        end
+    end
     local frame_links = {}                 -- clickable URL rects drawn this frame
-    local measure = self.on_link and self:measure_fn() or nil
+    local measure = self:measure_fn()
+    local function draw_links(value, left, top)
+        if not self.on_link then return end
+        for _, lk in ipairs(find_links(value)) do
+            local lx = left + measure(value:sub(1, lk.s - 1))
+            local lw, color = measure(lk.url), M.link_color
+            rg.draw_text(lk.url, lx, top, self.font_size, table.unpack(color))
+            rg.draw_rectangle(lx, top + self.font_size + 1, lw, 1, table.unpack(color))
+            frame_links[#frame_links + 1] = { x = lx, y = top, w = lw, h = self.line_h, url = lk.url }
+        end
+    end
     local first = math.max(1, math.floor(self.scroll / self.line_h))
     for i = first, total do
         local ly = y + pad + (i - 1) * self.line_h - self.scroll
@@ -374,27 +461,51 @@ function View:draw(entries, x, y, w, h)
         local r = row_at(i)
         if r.copy then
             if r.copy == hover_entry and ly >= y - self.line_h then
-                if rg.button(x + pad, ly, 28, self.line_h - 2, '#16#') and self.on_copy then
+                if surface.button(rg, text_x, ly, 56, self.line_h - 2, '复制',
+                    M.card_colors[r.copy.role] or bg, M.card_colors.label, 5) and self.on_copy then
                     self.on_copy(r.copy)
                 end
             end
-        elseif r.text and r.text ~= '' then
-            if r.bg then
-                rg.draw_rectangle(x + pad - 3, ly - 1, width + 6, self.line_h, r.bg[1], r.bg[2], r.bg[3], r.bg[4])
+        elseif r.cells then
+            local fill = r.table_header and M.card_colors.user or M.card_colors.assistant
+            local border = markdown.palette.hr
+            for col, value in ipairs(r.cells) do
+                local cx = text_x + (col - 1) * r.cell_width
+                rg.draw_rectangle(cx, ly, r.cell_width, self.line_h, table.unpack(fill))
+                rg.draw_rectangle(cx, ly, r.cell_width, 1, table.unpack(border))
+                rg.draw_rectangle(cx, ly + self.line_h - 1, r.cell_width, 1, table.unpack(border))
+                rg.draw_rectangle(cx, ly, 1, self.line_h, table.unpack(border))
+                self:draw_line(value, cx + 8, ly, r.color)
+                if r.table_header then self:draw_line(value, cx + 8.6, ly, r.color) end
+                draw_links(value, cx + 8, ly)
             end
-            self:draw_line(r.text, x + pad, ly, r.color)
+            rg.draw_rectangle(text_x + width - 1, ly, 1, self.line_h, table.unpack(border))
+        elseif r.text and (r.text ~= '' or r.bg) then
+            if r.bg then
+                rg.draw_rectangle(text_x, ly - 1, width, self.line_h, table.unpack(r.bg))
+            end
+            local draw_x = text_x + (r.bg and 8 or 0)
+            if r.label or r.code_header then
+                rg.draw_text(r.text, draw_x, ly + 2, 12, table.unpack(r.color))
+                if r.code_header and surface.button(rg, text_x + width - 56, ly, 56, self.line_h - 2,
+                    '复制', r.bg, M.card_colors.label, 4) and self.on_copy then
+                    self.on_copy({ text = table.concat(r.code_header.lines, '\n'), role = 'assistant' })
+                end
+            else
+                self:draw_line(r.text, draw_x, ly, r.color)
+                if r.bold then self:draw_line(r.text, draw_x + 0.6, ly, r.color) end
+                if not r.bold then
+                    for _, span in ipairs(r.bold_spans or {}) do
+                        local bx = draw_x + measure(r.text:sub(1, span.first - 1))
+                        self:draw_line(r.text:sub(span.first, span.last), bx + 0.6, ly, r.color)
+                    end
+                end
+            end
             -- Overdraw any URLs in link color + underline, and record a rect so a
             -- click on it opens the link. Same glyphs over the same pixels, so it
             -- just recolors; alignment uses the emoji-aware measure_fn.
-            if measure then
-                for _, lk in ipairs(find_links(r.text)) do
-                    local lx = x + pad + measure(r.text:sub(1, lk.s - 1))
-                    local lw = measure(lk.url)
-                    local LC = M.link_color
-                    rg.draw_text(lk.url, lx, ly, self.font_size, LC[1], LC[2], LC[3], LC[4])
-                    rg.draw_rectangle(lx, ly + self.font_size + 1, lw, 1, LC[1], LC[2], LC[3], LC[4])
-                    frame_links[#frame_links + 1] = { x = lx, y = ly, w = lw, h = self.line_h, url = lk.url }
-                end
+            if not r.code and not r.code_header and not r.label then
+                draw_links(r.text, draw_x, ly)
             end
         end
     end

@@ -1322,14 +1322,21 @@ local function apply_theme(name)
 
     markdown.palette = {
         text    = txt,
-        heading = accent,
-        code    = dark and { 130, 205, 150, 255 } or { 22, 120, 66, 255 },
-        bullet  = mix(accent, txt, 0.35),
+        heading = txt,
+        code    = dark and { 190, 215, 205, 255 } or txt,
+        bullet  = txt,
         quote   = muted,
         hr      = mix(txt, bg, 0.62),
         table   = mix(txt, bg, 0.18),
     }
-    markdown.code_bg = dark and shift(bg, 16) or shift(bg, -14)
+    markdown.code_bg = name == 'soft' and { 241, 245, 245, 255 }
+        or (dark and shift(bg, 16) or shift(bg, -14))
+    transcript.card_colors = {
+        user = name == 'soft' and { 239, 247, 244, 255 } or mix(bg, accent, dark and 0.18 or 0.10),
+        assistant = dark and shift(bg, 8) or { 255, 255, 255, 255 },
+        label = accent,
+    }
+    transcript.link_color = accent
 
     transcript.role_colors.user        = accent
     transcript.role_colors.assistant   = txt
@@ -1339,7 +1346,7 @@ local function apply_theme(name)
     transcript.role_colors.error       = { 220, 90, 90, 255 }
 
     S.view_bg = bg
-    S.header_bg = base
+    S.header_bg = name == 'soft' and { 230, 235, 233, 255 } or base
     S.sidebar_bg = name == 'soft' and { 250, 248, 248, 255 } or shift(bg, dark and 8 or -8)
     for _, tab in ipairs(S.tabs) do
         if tab.view then tab.view.bg = bg; tab.view:invalidate() end
@@ -2476,13 +2483,14 @@ end
 -- minimize / maximize-restore / close, hand-drawn icons over flat buttons
 local function draw_window_controls(W)
     local txt = text_col()
+    local bg = S.header_bg or S.view_bg
     local x = W - 3 * WINBTN_W
     local cy = math.floor(HEADER_H / 2)
-    if flat_button(x, 0, WINBTN_W, HEADER_H, '') then raygui.minimize_window() end
+    if flat_button(x, 0, WINBTN_W, HEADER_H, '', bg) then raygui.minimize_window() end
     raygui.draw_rectangle(x + 18, cy, 10, 1, txt[1], txt[2], txt[3], 255)
 
     x = x + WINBTN_W
-    if flat_button(x, 0, WINBTN_W, HEADER_H, '') then toggle_maximize() end
+    if flat_button(x, 0, WINBTN_W, HEADER_H, '', bg) then toggle_maximize() end
     local function box(bx, by, n)
         raygui.draw_rectangle(bx, by, n, 1, txt[1], txt[2], txt[3], 255)
         raygui.draw_rectangle(bx, by + n - 1, n, 1, txt[1], txt[2], txt[3], 255)
@@ -2491,7 +2499,6 @@ local function draw_window_controls(W)
     end
     if raygui.is_window_maximized() then        -- restore: two overlapping squares
         box(x + 20, cy - 6, 8)
-        local bg = S.view_bg or { 240, 240, 240, 255 }
         raygui.draw_rectangle(x + 18, cy - 4, 8, 8, bg[1], bg[2], bg[3], 255)
         box(x + 18, cy - 4, 8)
     else
@@ -2501,13 +2508,13 @@ local function draw_window_controls(W)
     x = x + WINBTN_W
     local mx, my = raygui.get_mouse()
     local over = mx >= x and my >= 0 and my < HEADER_H
-    if flat_button(x, 0, WINBTN_W, HEADER_H, '', nil, { 196, 43, 28, 255 }) then S.quit = true end
+    if flat_button(x, 0, WINBTN_W, HEADER_H, '', bg, { 196, 43, 28, 255 }) then S.quit = true end
     draw_x(x + 15, 0, 16, HEADER_H, over and { 255, 255, 255, 255 } or txt, 5)
 end
 
 -- ── top bar ─────────────────────────────────────────────────────────────────
 -- [≡]  session title  (workspace)   status · usage ........ 12.3k tok ▬▬▬  [⋮]
--- Flat, on the content background like the conversation below it: ≡ toggles
+-- A separate surface distinguishes the window controls from the conversation: ≡ toggles
 -- the projects/sessions sidebar, the workspace chip picks another directory,
 -- ⋮ lists the right-panel pages. (The model picker lives in the composer.)
 
@@ -2530,7 +2537,7 @@ local function dir_name(d)
 end
 
 local function draw_header(W, tab)
-    local bg = S.view_bg or { 240, 240, 240, 255 }
+    local bg = S.header_bg or S.view_bg or { 240, 240, 240, 255 }
     raygui.draw_rectangle(0, 0, W, HEADER_H, bg[1], bg[2], bg[3], 255)
     local txt, muted = text_col(), muted_col()
 
@@ -2539,7 +2546,7 @@ local function draw_header(W, tab)
     S.hdr_hits = hits
 
     -- ≡: three bars over a flat button (the font's ☰ isn't reliable at this size)
-    if flat_button(6, 5, 34, 28, '') then toggle_sidebar() end
+    if flat_button(6, 5, 34, 28, '', bg) then toggle_sidebar() end
     local lc = S.sidebar and accent_col() or txt
     for k = 0, 2 do raygui.draw_rectangle(15, 12 + k * 6, 16, 2, lc[1], lc[2], lc[3], 255) end
 
@@ -2597,7 +2604,7 @@ local function draw_header(W, tab)
 
     -- ⋮: the page menu (drawn by draw_dropdown_overlays like the other lists)
     local on = S.panel or S.dd_open == 'menu'
-    if flat_button(kx, 5, 34, 28, '') then
+    if flat_button(kx, 5, 34, 28, '', bg) then
         S.dd_open = (S.dd_open ~= 'menu') and 'menu' or nil
     end
     local dc = on and accent_col() or txt
@@ -3006,7 +3013,7 @@ local function draw_composer_toolbar(tab, x, iy, w)
     local mode_w = compact and 62 or 132
     local mode_lbl = (S.mode == 'ask') and (compact and '询问' or '询问 · 写前确认')
         or (compact and '写入' or '写入 · 自动执行')
-    if surface.button(raygui, x + 36, ty, mode_w, bh, mode_lbl, bg, txt, 7) then
+    if surface.button(raygui, x + 36, ty, mode_w, bh, mode_lbl, mix(bg, ac, 0.10), ac, 12) then
         S.mode = (S.mode == 'ask') and 'write' or 'ask'
         tab.status = (S.mode == 'ask') and '询问模式：写操作前确认' or '写入模式：自动执行'
     end
