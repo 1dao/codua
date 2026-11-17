@@ -240,6 +240,40 @@ spec.describe('markdown', function()
         spec.equal(rows[2].bold_spans[1].last, 3)
     end)
 
+    spec.it('draws links once and preserves character spacing at styled boundaries', function()
+        local calls, rg = {}, {}
+        rg.measure_text=function(s)
+            local n = utf8.len(s)
+            return n == 0 and 0 or n * 10 + (n - 1) * 2
+        end
+        rg.get_mouse=function() return -100,-100 end
+        rg.get_wheel=function() return 0 end
+        rg.draw_rectangle=function() end
+        rg.begin_scissor=function() end
+        rg.end_scissor=function() end
+        rg.draw_text=function(value,x,y,size,r,g,b)
+            calls[#calls+1]={text=value,x=x,r=r,g=g,b=b}
+        end
+        local view=transcript.new_view({raygui=rg})
+        view.on_link=function() end
+        local url, second = 'https://example.com/api', 'https://example.org/v1'
+        view:draw({{role='assistant',text='前缀 '..url..' 后缀 '..second..' **粗体**'}},0,0,1800,300)
+        local found, prefix = {}, nil
+        for _, call in ipairs(calls) do
+            if call.text == '前缀 ' then prefix=call end
+            if call.text:find('https://',1,true) then
+                spec.truthy(call.text == url or call.text == second)
+                found[call.text]=(found[call.text] or 0)+1
+                spec.equal(call.r,transcript.link_color[1])
+                spec.equal(call.g,transcript.link_color[2])
+                spec.equal(call.b,transcript.link_color[3])
+                if call.text == url then spec.equal(call.x-prefix.x,36) end
+            end
+        end
+        spec.equal(found[url],1)
+        spec.equal(found[second],1)
+    end)
+
     spec.it('draws message gaps and blank code rows and copies the unwrapped code', function()
         local rg, copied = {}, nil
         for i, key in ipairs({'BUTTON','BORDER_WIDTH','BASE_COLOR_NORMAL','BASE_COLOR_FOCUSED',

@@ -444,14 +444,43 @@ function View:draw(entries, x, y, w, h)
     end
     local frame_links = {}                 -- clickable URL rects drawn this frame
     local measure = self:measure_fn()
-    local function draw_links(value, left, top)
-        if not self.on_link then return end
-        for _, lk in ipairs(find_links(value)) do
-            local lx = left + measure(value:sub(1, lk.s - 1))
-            local lw, color = measure(lk.url), M.link_color
-            rg.draw_text(lk.url, lx, top, self.font_size, table.unpack(color))
-            rg.draw_rectangle(lx, top + self.font_size + 1, lw, 1, table.unpack(color))
-            frame_links[#frame_links + 1] = { x = lx, y = top, w = lw, h = self.line_h, url = lk.url }
+    local function draw_text_runs(value, left, top, color, bold, spans, allow_links)
+        local links = allow_links and self.on_link and find_links(value) or {}
+        local boundaries = {1, #value + 1}
+        for _, link in ipairs(links) do
+            boundaries[#boundaries + 1] = link.s
+            boundaries[#boundaries + 1] = link.e + 1
+        end
+        for _, span in ipairs(spans or {}) do
+            boundaries[#boundaries + 1] = span.first
+            boundaries[#boundaries + 1] = span.last + 1
+        end
+        table.sort(boundaries)
+        local function position(first)
+            if first == 1 then return left end
+            -- Text measurement omits trailing character spacing. A sentinel
+            -- preserves that advance when a styled run starts mid-line.
+            return left + measure(value:sub(1, first - 1) .. ' ') - measure(' ')
+        end
+        for i = 1, #boundaries - 1 do
+            local first, last = boundaries[i], boundaries[i + 1] - 1
+            if first <= last then
+                local ink, strong = color, bold
+                for _, link in ipairs(links) do
+                    if first >= link.s and first <= link.e then ink = M.link_color; break end
+                end
+                for _, span in ipairs(spans or {}) do
+                    if first >= span.first and first <= span.last then strong = true; break end
+                end
+                local run, draw_x = value:sub(first, last), position(first)
+                self:draw_line(run, draw_x, top, ink)
+                if strong then self:draw_line(run, draw_x + 0.6, top, ink) end
+            end
+        end
+        for _, link in ipairs(links) do
+            local lx, lw = position(link.s), measure(link.url)
+            rg.draw_rectangle(lx, top + self.font_size + 1, lw, 1, table.unpack(M.link_color))
+            frame_links[#frame_links + 1] = { x = lx, y = top, w = lw, h = self.line_h, url = link.url }
         end
     end
     local first = math.max(1, math.floor(self.scroll / self.line_h))
@@ -475,9 +504,7 @@ function View:draw(entries, x, y, w, h)
                 rg.draw_rectangle(cx, ly, r.cell_width, 1, table.unpack(border))
                 rg.draw_rectangle(cx, ly + self.line_h - 1, r.cell_width, 1, table.unpack(border))
                 rg.draw_rectangle(cx, ly, 1, self.line_h, table.unpack(border))
-                self:draw_line(value, cx + 8, ly, r.color)
-                if r.table_header then self:draw_line(value, cx + 8.6, ly, r.color) end
-                draw_links(value, cx + 8, ly)
+                draw_text_runs(value, cx + 8, ly, r.color, r.table_header, nil, true)
             end
             rg.draw_rectangle(text_x + width - 1, ly, 1, self.line_h, table.unpack(border))
         elseif r.text and (r.text ~= '' or r.bg) then
@@ -492,20 +519,7 @@ function View:draw(entries, x, y, w, h)
                     self.on_copy({ text = table.concat(r.code_header.lines, '\n'), role = 'assistant' })
                 end
             else
-                self:draw_line(r.text, draw_x, ly, r.color)
-                if r.bold then self:draw_line(r.text, draw_x + 0.6, ly, r.color) end
-                if not r.bold then
-                    for _, span in ipairs(r.bold_spans or {}) do
-                        local bx = draw_x + measure(r.text:sub(1, span.first - 1))
-                        self:draw_line(r.text:sub(span.first, span.last), bx + 0.6, ly, r.color)
-                    end
-                end
-            end
-            -- Overdraw any URLs in link color + underline, and record a rect so a
-            -- click on it opens the link. Same glyphs over the same pixels, so it
-            -- just recolors; alignment uses the emoji-aware measure_fn.
-            if not r.code and not r.code_header and not r.label then
-                draw_links(r.text, draw_x, ly)
+                draw_text_runs(r.text, draw_x, ly, r.color, r.bold, r.bold_spans, not r.code)
             end
         end
     end
