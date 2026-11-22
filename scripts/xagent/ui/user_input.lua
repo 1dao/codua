@@ -35,6 +35,7 @@ end
 -- The bundled renderer exposes rectangles only. Strips provide rounded corners
 -- without textures, font icons, or a native runtime rebuild.
 local function rounded(rg, x, y, w, h, radius, color)
+    if rg.draw_rounded_rectangle then return rg.draw_rounded_rectangle(x, y, w, h, radius, table.unpack(color)) end
     x, y, w, h = math.floor(x), math.floor(y), math.floor(w), math.floor(h)
     local r = math.max(0, math.min(radius, math.floor(w / 2), math.floor(h / 2)))
     rg.draw_rectangle(x, y + r, w, h - 2 * r, color[1], color[2], color[3], 255)
@@ -194,7 +195,8 @@ function M.draw(tab, rg, x, y, w, h, colors, locked, stop)
             rg.set_style(rg.TEXTBOX, prop, prop == rg.BORDER_WIDTH and 0 or ((bg[1] << 24) | (bg[2] << 16) | (bg[3] << 8) | 255))
         end
     end
-    a.text, p.edit, submitted = rg.textbox_multi(x + 40, fy + 8, w - 224, 34, a.text, not locked and p.edit or false, true)
+    a.text, p.edit, submitted = rg.textbox_multi(x + 40, fy + 8, w - 224, 34, a.text,
+        not locked and p.edit or false, true, 'question:' .. tostring(tab.id) .. ':' .. p.index, locked)
     for prop, value in pairs(saved) do rg.set_style(rg.TEXTBOX, prop, value) end
     if a.text == '' then text('或自行撰写回复', x + 46, fy + 17, mix(bg, fg, 0.30)) end
     local valid = question_tool.validate_answers({ questions = { q } }, p.answers) ~= nil

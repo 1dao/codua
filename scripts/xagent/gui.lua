@@ -12,7 +12,7 @@ package.path = 'scripts/?.lua;tools/?.lua;' .. package.path
 package.cpath = 'tools/?.dll;tools/?.so;' .. package.cpath
 
 local router        = dofile('scripts/core/share/xrouter.lua')
-local raygui        = require('raygui')
+local raygui        = (...) == 'webview' and require('xagent.ui.webview_surface') or require('raygui')
 local xutils        = require('xutils')
 local config        = require('xagent.config')
 local registry      = require('xagent.tools.registry')
@@ -150,6 +150,8 @@ local S = {
     history_query_edit = false,
     history_collapsed = false,
     history_group_open = {},  -- directory key -> explicit expanded/collapsed override
+    history_show_all = {},    -- project key -> show older conversations as well
+    history_archived = false,
     files_open = {},           -- dir_key(cwd) -> { [rel_dir] = true } expanded tree nodes
     files_scroll = 0,          -- pixel scroll of the file tree
     -- API request/response log panel (in-memory, this run only)
@@ -160,8 +162,7 @@ local S = {
     rename_text = '',
     rename_edit = false,
     confirm_delete = nil,      -- id of the session awaiting delete confirmation
-    menu_item = nil,           -- history item whose ⋮ menu is open
-    menu_y = 0,                -- screen y of that menu
+    menu_item = nil,           -- id of the conversation whose menu is open
     -- theme
     theme = 'soft',
     ui_scale = 1,
@@ -182,7 +183,8 @@ local function refresh_display()
     S.display = surface.adapt_display(raygui, S.ui_scale)
     local display = S.display
     if previous and display and (previous.ui_scale ~= display.ui_scale
-        or previous.dpi_x ~= display.dpi_x or previous.dpi_y ~= display.dpi_y) then
+        or previous.dpi_x ~= display.dpi_x or previous.dpi_y ~= display.dpi_y
+        or previous.metrics_revision ~= display.metrics_revision) then
         -- Rerasterized glyphs can have slightly different metrics even when the
         -- window's logical width stays unchanged after a monitor/DPI change.
         for _, tab in ipairs(S.tabs) do tab.view:invalidate() end
@@ -522,6 +524,11 @@ local function make_on_event(tab, sess)
     end
 end
 
+local function save_session(sess)
+    local ok, path = pcall(sess.save, sess)
+    if ok and path then S.history_dirty = true end
+end
+
 -- Slash commands handled locally (not sent to the model). Returns true if the
 -- input was a command (and was consumed).
 -- ── MCP servers: shared by /mcp and the settings panel ──────────────────────
@@ -714,7 +721,7 @@ local function handle_slash(text)
         local handler = make_on_event(tab, sess)
         local co = coroutine.create(function()
             sess:compact(rest ~= '' and rest or nil, handler)
-            pcall(function() sess:save() end)
+            save_session(sess)
             if tab.sess == sess then tab.busy = false; tab.status = 'ready' end
         end)
         local ok, err = coroutine.resume(co)
@@ -797,7 +804,7 @@ local function handle_slash(text)
         sess.cancelled = nil
         sess:add_user(prompt)
         local co = coroutine.create(function()
-            sess:run(handler); pcall(function() sess:save() end)
+            sess:run(handler); save_session(sess)
         end)
         local ok, err = coroutine.resume(co)
         if not ok then handler({ type = 'error', error = err }) end
@@ -854,7 +861,7 @@ local function submit()
 
     local co = coroutine.create(function()
         sess:run(handler)
-        pcall(function() sess:save() end)   -- save the session that RAN (the active tab may have changed)
+        save_session(sess)                 -- the active tab may have changed while this turn ran
     end)
     local ok, err = coroutine.resume(co)
     if not ok then handler({ type = 'error', error = err }) end
@@ -933,8 +940,10 @@ local function fit_label(s, maxw, size)
     return prefix(lo)
 end
 
-local function refresh_history()   -- reload items; keeps scroll, clears inline modes
+local function refresh_history(keep_actions)
     S.history_items = session.list()
+    S.history_dirty = nil
+    if keep_actions then return end
     S.renaming = nil
     S.confirm_delete = nil
     S.menu_item = nil
@@ -1166,10 +1175,17 @@ end
 -- Load a saved session into the ACTIVE tab (runs under that tab's model).
 local function load_history_item(it)
     if not it then return end
+    for i, open in ipairs(S.tabs) do
+        if open.sess and open.sess.id == it.id then select_tab(i); return end
+    end
     local tab = T()
     local s2 = session.load(it.path, { cfg = tab.cfg })
     if not s2 then tab.status = 'load failed'; return end
-    cancel_session(tab)
+    if tab.busy or tab.input ~= '' or #tab.attachments > 0 then
+        tab = new_tab(tab.cfg, s2.cwd)
+    else
+        cancel_session(tab)
+    end
     s2.tools = registry.to_api_params()
     s2.system = build_system(s2.cwd)
     s2.max_tokens = MAX_TOKENS
@@ -1198,7 +1214,8 @@ end
 local function do_rename(it)
     local name = (S.rename_text or ''):gsub('^%s+', ''):gsub('%s+$', '')
     if name ~= '' then
-        session.rename(it.path, name)
+        local ok, err = session.rename(it.path, name)
+        if not ok then T().status = '重命名失败：' .. tostring(err); return end
         for _, tab in ipairs(S.tabs) do
             if tab.sess and tab.sess.id == it.id then tab.sess.title = name end
         end
@@ -1208,8 +1225,16 @@ local function do_rename(it)
 end
 
 local function do_delete(it)
-    session.delete(it.path)
+    local ok, err = session.delete(it.path)
+    if not ok then T().status = '删除失败：' .. tostring(err); return end
     S.confirm_delete = nil
+    refresh_history()
+end
+
+local function toggle_history_flag(it, flag)
+    local ok, err = session.set_history_flag(it.path, flag, not it[flag])
+    if not ok then T().status = '更新历史失败：' .. tostring(err); return end
+    if flag == 'archived' then T().status = it.archived and '会话已移回历史' or '会话已归档' end
     refresh_history()
 end
 
@@ -1877,7 +1902,7 @@ local function draw_add_model_modal(W, H)
         if raygui.button(x, y, w, 30, '打开创建 Token 页面') then open_page(preset.key_url) end
         y = y + 42
         hint('3. 复制新密钥，回到这里粘贴（Ctrl+V）')
-        f.token, f.token_e = raygui.textbox(x, y, w, 30, f.token, f.token_e)
+        f.token, f.token_e = raygui.textbox(x, y, w, 30, f.token, f.token_e, 'model:free-token', 'API Key')
         y = y + 42
         hint('模型和 API 地址将自动填写，下一步检查并保存。')
         hint('免费试用受平台限流与数据使用条款约束。')
@@ -1901,7 +1926,7 @@ local function draw_add_model_modal(W, H)
     local rh, row = 30, my + 48
     local function fld(label, id)
         raygui.label(mx + pad, row + 4, lblw, 22, label)
-        f[id], f[id .. '_e'] = raygui.textbox(fx, row, fw, rh - 4, f[id], f[id .. '_e'])
+        f[id], f[id .. '_e'] = raygui.textbox(fx, row, fw, rh - 4, f[id], f[id .. '_e'], 'model:' .. id, label)
         row = row + rh + 6
     end
 
@@ -2211,7 +2236,7 @@ local function draw_mcp_modal(W, H)
     local row = my + 48
     local function fld(label, id)
         raygui.label(mx + pad, row + 4, lblw, 22, label)
-        f[id], f[id .. '_e'] = raygui.textbox(fx, row, fw, rh - 4, f[id], f[id .. '_e'])
+        f[id], f[id .. '_e'] = raygui.textbox(fx, row, fw, rh - 4, f[id], f[id .. '_e'], 'mcp:' .. id, label)
         row = row + rh + 6
     end
     fld('名称', 'name')
@@ -2237,8 +2262,8 @@ local function draw_mcp_modal(W, H)
     local kw = 170
     for i, h in ipairs(rows) do
         raygui.label(mx + pad, row + 4, lblw, 22, (stdio and '变量 ' or '请求头 ') .. i)
-        h.key, h.key_e = raygui.textbox(fx, row, kw, rh - 4, h.key, h.key_e)
-        h.val, h.val_e = raygui.textbox(fx + kw + 6, row, fw - kw - 6, rh - 4, h.val, h.val_e)
+        h.key, h.key_e = raygui.textbox(fx, row, kw, rh - 4, h.key, h.key_e, 'mcp:key:' .. i, what .. '名称 ' .. i)
+        h.val, h.val_e = raygui.textbox(fx + kw + 6, row, fw - kw - 6, rh - 4, h.val, h.val_e, 'mcp:value:' .. i, what .. '值 ' .. i)
         if h.orig and h.val == '' and not h.val_e then
             raygui.label(fx + kw + 14, row + 3, fw - kw - 20, 22, '（已设置）')
         end
@@ -2619,24 +2644,22 @@ local function draw_header(W, tab)
 end
 
 -- ── sidebar pages ───────────────────────────────────────────────────────────
--- Left sidebar — history: search + group folding, sessions grouped by working
--- directory, each row showing its title over a muted "time · message count"
--- line (near-identical titles are otherwise impossible to tell apart).
--- Preserve the session list's recency order. Folding changes visibility of
--- sessions, never which projects are present in the history overview.
-local function build_history_groups(items, query, collapsed, open_by_key, key_for_dir)
+-- Group by workspace in recency order. Searching includes older rows and
+-- expands matches, even when the corresponding workspace is folded.
+local function build_history_groups(items, query, collapsed, open_by_key, key_for_dir, archived)
     local groups, by_key, shown = {}, {}, 0
     local q = (query or ''):lower():gsub('^%s+', ''):gsub('%s+$', '')
     for _, item in ipairs(items) do
         local dir = item.cwd or '?'
-        local key = key_for_dir(dir)
         local matches = q == '' or dir:lower():find(q, 1, true)
             or tostring(item.title or ''):lower():find(q, 1, true)
-        if matches then
+        if matches and (item.archived == true) == (archived == true) then
+            local key = key_for_dir(dir)
             local group = by_key[key]
             if not group then
                 local expanded = open_by_key[key]
-                if expanded == nil then expanded = not collapsed or q ~= '' end
+                if q ~= '' then expanded = true
+                elseif expanded == nil then expanded = not collapsed end
                 group = { key = key, dir = dir, items = {}, expanded = expanded }
                 groups[#groups + 1], by_key[key] = group, group
             end
@@ -2647,137 +2670,214 @@ local function build_history_groups(items, query, collapsed, open_by_key, key_fo
     return groups, shown
 end
 
+local HISTORY_RECENT = 5
+
+local function build_history_rows(groups, show_all, searching, active_id)
+    local rows, y = {}, 0
+    local function push(kind, value, h)
+        rows[#rows + 1] = { kind = kind, value = value, y = y, h = h }
+        y = y + h
+    end
+    for _, group in ipairs(groups) do
+        push('group', group, 34)
+        if group.expanded then
+            local all = searching or show_all[group.key]
+            local recent, hidden = 0, 0
+            for _, item in ipairs(group.items) do
+                if item.pinned then push('session', item, 32) end
+            end
+            for _, item in ipairs(group.items) do
+                if not item.pinned then
+                    recent = recent + 1
+                    if all or recent <= HISTORY_RECENT or item.id == active_id then
+                        push('session', item, 32)
+                    else
+                        hidden = hidden + 1
+                    end
+                end
+            end
+            if not searching and (hidden > 0 or (all and recent > HISTORY_RECENT)) then
+                push('more', { key = group.key, all = all, hidden = hidden }, 30)
+            end
+        end
+        y = y + 7
+    end
+    return rows, y
+end
+
+local function history_icon(kind, cx, cy, color)
+    local function rect(x, y, w, h)
+        raygui.draw_rectangle(math.floor(cx + x), math.floor(cy + y), w, h, table.unpack(color))
+    end
+    if kind == 'pin' then
+        rect(-4, -5, 8, 2)
+        rect(-2, -3, 4, 4)
+        rect(-5, 1, 10, 2)
+        rect(0, 3, 1, 4)
+    else
+        rect(-6, -5, 12, 2)
+        rect(-5, -2, 1, 7)
+        rect(4, -2, 1, 7)
+        rect(-5, 5, 10, 1)
+        rect(-2, 0, 4, 1)
+    end
+end
 
 local function draw_history_sidebar(x0, H, tab)
-    -- one header row: 历史会话 · [search…] · fold icon
-    local lw = raygui.measure_text('历史会话') + 12
-    draw_text_col('历史会话', x0 + 10, TOP + 9, FONT_SIZE, text_col())
-    local fold_w = 28
-    local fx = x0 + 10 + lw
-    local fw = SIDEBAR_W - (fx - x0) - fold_w - 14
-    S.history_query, S.history_query_edit = raygui.textbox(fx, TOP + 4, fw, 26,
-        S.history_query, S.history_query_edit)
+    if S.history_dirty then refresh_history(true) end
+    local bg, txt, muted, accent = S.sidebar_bg, text_col(), muted_col(), accent_col()
+    local selected_bg = mix(bg, accent, luma(bg) < 128 and 0.25 or 0.15)
+    local inset, right = x0 + 12, x0 + SIDEBAR_W - 12
+    local title = S.history_archived and '已归档会话' or '历史会话'
+    draw_text_col(title, inset + 3, TOP + 12, FONT_SIZE, txt)
+    if surface.button(raygui, right - 100, TOP + 6, 100, 28, '+ 新对话', selected_bg, accent, 8) then
+        new_tab(tab.cfg, tab.cwd)
+        tab = T()
+    end
+
+    local search_y, filter_w, fold_w = TOP + 38, 49, 48
+    local filter_x, fold_x = right - filter_w - fold_w - 4, right - fold_w
+    local search_w = filter_x - inset - 6
+    local previous_query = S.history_query
+    S.history_query, S.history_query_edit = raygui.textbox(inset, search_y, search_w, 27,
+        previous_query, S.history_query_edit, 'history:search', '搜索历史会话')
     if S.history_query == '' and not S.history_query_edit then
-        draw_text_col('搜索…', fx + 8, TOP + 9, FONT_SIZE, muted_col())
+        draw_text_col('搜索会话或工作区', inset + 7, search_y + 6, 14, muted)
     end
-
-    -- Folding hides session rows while retaining every project header.
-    local bx = x0 + SIDEBAR_W - 8 - fold_w
-    if flat_button(bx, TOP + 4, fold_w, 26, '', S.sidebar_bg) then
+    if previous_query ~= S.history_query then
+        S.history_scroll, S.menu_item, S.renaming, S.confirm_delete = 0, nil, nil, nil
+    end
+    if surface.button(raygui, filter_x, search_y, filter_w, 27,
+        S.history_archived and '历史' or '归档', S.history_archived and selected_bg or bg, txt, 7) then
+        S.history_archived = not S.history_archived
+        S.history_scroll, S.menu_item, S.renaming, S.confirm_delete = 0, nil, nil, nil
+    end
+    local searching = S.history_query:find('%S') ~= nil
+    if not searching and surface.button(raygui, fold_x, search_y, fold_w, 27,
+        S.history_collapsed and '展开' or '折叠', bg, muted, 7) then
         S.history_collapsed = not S.history_collapsed
-        S.history_group_open = {}
-        S.history_scroll = 0
-        S.menu_item = nil
+        S.history_group_open, S.history_scroll, S.menu_item = {}, 0, nil
     end
-    do
-        local c = S.history_collapsed and accent_col() or text_col()
-        local n, ix, iy = 11, bx + math.floor((fold_w - 11) / 2), TOP + 4 + math.floor((26 - 11) / 2)
-        raygui.draw_rectangle(ix, iy, n, 1, c[1], c[2], c[3], 255)
-        raygui.draw_rectangle(ix, iy + n - 1, n, 1, c[1], c[2], c[3], 255)
-        raygui.draw_rectangle(ix, iy, 1, n, c[1], c[2], c[3], 255)
-        raygui.draw_rectangle(ix + n - 1, iy, 1, n, c[1], c[2], c[3], 255)
-        raygui.draw_rectangle(ix + 3, iy + 5, 5, 1, c[1], c[2], c[3], 255)             -- minus
-        if S.history_collapsed then
-            raygui.draw_rectangle(ix + 5, iy + 3, 1, 5, c[1], c[2], c[3], 255)         -- plus
-        end
-    end
+    local divider = mix(bg, txt, 0.14)
+    raygui.draw_rectangle(inset, TOP + 72, right - inset, 1, table.unpack(divider))
 
-    -- Search both project paths and conversation titles.
-    local cur_key = dir_key(tab.cwd)
+    local active_id = tab.sess and tab.sess.id
     local groups, shown = build_history_groups(S.history_items, S.history_query,
-        S.history_collapsed, S.history_group_open, dir_key)
-    -- flatten into rows with their y offsets (headers are shorter than items)
-    local HEAD_H, ITEM_H = 30, FONT_SIZE + 32
-    local rows, y = {}, 0
-    for _, g in ipairs(groups) do
-        rows[#rows + 1] = { header = g, y = y, h = HEAD_H }; y = y + HEAD_H
-        if g.expanded then
-            for _, it in ipairs(g.items) do rows[#rows + 1] = { item = it, y = y, h = ITEM_H }; y = y + ITEM_H end
-        end
-    end
-
-    local list_top = TOP + 38
-    local view_h = H - list_top - 8
-    local over_list, wheel, mx, my = scroll_list('history_scroll', x0, list_top, view_h, y, ITEM_H)
+        S.history_collapsed, S.history_group_open, dir_key, S.history_archived)
+    local rows, content_h = build_history_rows(groups, S.history_show_all, searching, active_id)
+    local list_top = TOP + 81
+    local view_h = math.max(0, H - list_top - 7)
+    local over_list, wheel, mx, my = scroll_list('history_scroll', x0, list_top, view_h, content_h, 32)
     if wheel ~= 0 then S.menu_item = nil end
-
     if shown == 0 then
-        raygui.label(x0 + 10, list_top + 6, SIDEBAR_W - 20, 22,
-            (#S.history_items == 0) and '（暂无会话）' or '（没有匹配的会话）')
+        draw_text_col(searching and '没有匹配的会话' or (S.history_archived and '暂无归档会话' or '暂无历史会话'),
+            inset + 3, list_top + 9, 14, muted)
         return
     end
 
-    local kw = 26                                  -- ⋮ / icon button width
-    local rx, title_w = x0 + 8, SIDEBAR_W - 16     -- FULL width; ⋮ overlays on hover
-    local kx = x0 + SIDEBAR_W - 8 - kw             -- right-edge button
-    local kx2 = kx - kw - 4                        -- second-from-right button
-    local txt, muted = text_col(), muted_col()
+    local kw, row_x = 24, inset + 16
+    local kx = right - kw
+    local open_sessions = {}
+    for _, open in ipairs(S.tabs) do
+        if open.sess then open_sessions[open.sess.id] = open end
+    end
+    local hint
+    local function action(x, y, w, h, label, fill, kind, ink)
+        local hit = surface.button(raygui, x, y, w, h, '', fill, ink, 6)
+        if kind then history_icon(kind, x + w / 2, y + h / 2, ink) end
+        if over_list and mx >= x and mx < x + w and my >= y and my < y + h then
+            hint = { x, y, w, h, label }
+        end
+        return hit
+    end
 
     raygui.begin_scissor(x0, list_top, SIDEBAR_W, view_h)
     for _, row in ipairs(rows) do
         local ry = list_top + row.y - S.history_scroll
-        if ry + row.h > list_top and ry < list_top + view_h then   -- skip off-screen rows
-            local rh = row.h - 5
-            if row.header then
-                local g = row.header
-                local col = g.key == cur_key and accent_col() or txt
-                local count = tostring(#g.items)
+        if ry + row.h > list_top and ry < list_top + view_h then
+            local rh, value = row.h - 3, row.value
+            local over_row = over_list and my >= ry and my < ry + rh
+            if row.kind == 'group' then
+                local count = tostring(#value.items)
                 local count_w = raygui.measure_text(count, 13)
-                if flat_button(rx, ry, title_w, rh, '', S.sidebar_bg) then
-                    S.history_group_open[g.key] = not g.expanded
+                local group_bg = value.key == dir_key(tab.cwd) and mix(bg, accent, 0.07) or bg
+                if surface.button(raygui, inset, ry, right - inset, rh, '', group_bg, txt, 7) and not searching then
+                    S.history_group_open[value.key] = not value.expanded
                     S.menu_item = nil
                 end
-                if g.expanded then
-                    draw_caret(rx + 10, ry + rh / 2, col, false)
-                else
-                    for k = 0, 3 do
-                        raygui.draw_rectangle(rx + 8 + k, math.floor(ry + rh / 2) - 3 + k,
-                            1, 7 - 2 * k, col[1], col[2], col[3], 255)
-                    end
+                surface.icon(raygui, inset + 5, ry + (rh - 20) / 2, 'folder')
+                draw_text_col(fit_label(dir_name(value.dir), right - inset - count_w - 43), inset + 31, ry + 7, FONT_SIZE, txt)
+                draw_text_col(count, right - count_w - 8, ry + 8, 13, muted)
+                if over_row then hint = { inset, ry, right - inset, rh, value.dir } end
+            elseif row.kind == 'more' then
+                local label = value.all and '收起较早会话' or ('再显示 ' .. value.hidden .. ' 条')
+                if surface.button(raygui, row_x, ry, right - row_x, rh, '  ' .. label, bg, accent, 6) then
+                    S.history_show_all[value.key] = not value.all
+                    S.menu_item = nil
                 end
-                draw_text_col(fit_label(dir_tail(g.dir), title_w - count_w - 44), rx + 24, ry + 5, FONT_SIZE, col)
-                draw_text_col(count, rx + title_w - count_w - 10, ry + 6, 13, muted)
             else
-                local it = row.item
+                local it = value
+                local active = it.id == active_id
+                local fill = active and selected_bg or bg
                 if it.id == S.renaming then
-                    S.rename_text, S.rename_edit = raygui.textbox(rx, ry, title_w - 2 * kw - 8, rh, S.rename_text, S.rename_edit)
-                    if surface.icon_button(raygui, kx2, ry, kw, rh, 'confirm', S.sidebar_bg, txt) then do_rename(it) end
-                    if surface.icon_button(raygui, kx, ry, kw, rh, 'cancel', S.sidebar_bg, txt) then S.renaming = nil end
+                    S.rename_text, S.rename_edit = raygui.textbox(row_x, ry, kx - kw - row_x - 4, rh,
+                        S.rename_text, S.rename_edit, 'history:rename:' .. it.id, '会话名称')
+                    if surface.icon_button(raygui, kx - kw, ry, kw, rh, 'confirm', fill, txt) then do_rename(it) end
+                    if surface.icon_button(raygui, kx, ry, kw, rh, 'cancel', fill, txt) then S.renaming = nil end
                 elseif it.id == S.confirm_delete then
-                    raygui.label(rx + 4, ry + 4, title_w - 2 * kw - 30, rh - 8, '删除？')
-                    if surface.icon_button(raygui, kx2, ry, kw, rh, 'confirm', S.sidebar_bg, txt) then do_delete(it) end
-                    if surface.icon_button(raygui, kx, ry, kw, rh, 'cancel', S.sidebar_bg, txt) then S.confirm_delete = nil end
-                elseif S.menu_item == it then
-                    -- ⋮ clicked: reveal 修改 / 删除 on this row
-                    local bw = (title_w - kw - 8) / 2
-                    if surface.icon_button(raygui, rx, ry, bw, rh, 'edit', S.sidebar_bg, txt) then start_rename(it) end
-                    if surface.icon_button(raygui, rx + bw + 4, ry, bw, rh, 'delete', S.sidebar_bg, txt) then
-                        S.confirm_delete = it.id; S.renaming = nil; S.menu_item = nil
+                    raygui.label(row_x + 6, ry, kx - kw - row_x - 6, rh, '永久删除这条会话？')
+                    if surface.icon_button(raygui, kx - kw, ry, kw, rh, 'confirm', fill, txt) then do_delete(it) end
+                    if surface.icon_button(raygui, kx, ry, kw, rh, 'cancel', fill, txt) then S.confirm_delete = nil end
+                elseif S.menu_item == it.id then
+                    if surface.button(raygui, row_x, ry, 80, rh, '重命名', fill, txt, 6) then start_rename(it) end
+                    if surface.button(raygui, row_x + 84, ry, 54, rh, '删除', fill, txt, 6) then
+                        S.confirm_delete, S.menu_item = it.id, nil
                     end
-                    if kebab_button(kx, ry, kw, rh, txt) then S.menu_item = nil end   -- 再点收起
+                    if surface.icon_button(raygui, kx, ry, kw, rh, 'cancel', fill, txt) then S.menu_item = nil end
                 else
-                    -- empty button (hover bg + click) with the two text lines drawn
-                    -- over it; the ⋮ OVERLAYS the right edge on hover, so a click
-                    -- there must not also load the session.
-                    local over_row = over_list and my >= ry and my < ry + rh
-                    local over_kebab = over_row and mx >= kx and mx < kx + kw
-                    local clicked = raygui.button(rx, ry, title_w, rh, '')
-                    local tcol = (tab.sess and tab.sess.id == it.id) and accent_col() or txt
-                    draw_text_col(fit_label(it.title, title_w - 24 - (over_row and kw or 0)),
-                        rx + 10, ry + 5, FONT_SIZE, tcol)
-                    local when = (tonumber(it.created_at) or 0) > 0
-                        and os.date('%m-%d %H:%M', it.created_at) or '—'
-                    draw_text_col(when .. '  ·  ' .. tostring(it.n or 0) .. ' 条',
-                        rx + 10, ry + 9 + FONT_SIZE, 13, muted)
-                    if over_row then
-                        if kebab_button(kx, ry, kw, rh, txt) then S.menu_item = it end
+                    local actions = over_row and mx >= row_x and mx < right
+                    local action_x = actions and kx - (it.archived and 1 or 2) * kw or right
+                    local clicked = surface.button(raygui, row_x, ry, right - row_x, rh, '', fill, txt, 8)
+                    if active then
+                        raygui.draw_rectangle(row_x + 2, ry + 6, 2, rh - 12, table.unpack(accent))
                     end
-                    if clicked and not over_kebab then load_history_item(it) end
+                    local open = open_sessions[it.id]
+                    local busy = open and open.busy
+                    local marker_x = action_x - 10
+                    if not actions and it.pinned then
+                        history_icon('pin', right - 12, ry + rh / 2, accent)
+                        marker_x = marker_x - 18
+                    end
+                    if busy then
+                        raygui.draw_rectangle(marker_x - 3, ry + math.floor(rh / 2) - 2, 5, 5, table.unpack(accent))
+                    end
+                    local text_right = busy and marker_x - 8 or marker_x
+                    draw_text_col(fit_label(it.title, text_right - row_x - 11), row_x + 10, ry + 6, FONT_SIZE, txt)
+                    if actions then
+                        if mx < action_x then
+                            local when = (tonumber(it.updated_at) or 0) > 0
+                                and os.date('%m-%d %H:%M', it.updated_at) or '—'
+                            hint = { row_x, ry, action_x - row_x, rh, when .. '  ·  ' .. tostring(it.n or 0) .. ' 条消息' }
+                        end
+                        if not it.archived and action(kx - 2 * kw, ry, kw, rh,
+                            it.pinned and '取消置顶' or '置顶', fill, 'pin', it.pinned and accent or muted) then
+                            toggle_history_flag(it, 'pinned')
+                        end
+                        if action(kx - kw, ry, kw, rh, it.archived and '移回历史' or '归档', fill, 'archive', muted) then
+                            toggle_history_flag(it, 'archived')
+                        end
+                        if action(kx, ry, kw, rh, '会话操作', fill, nil, muted) then S.menu_item = it.id end
+                        for k = -1, 1 do
+                            raygui.draw_rectangle(kx + 11, math.floor(ry + rh / 2) + k * 4 - 1, 2, 2, table.unpack(muted))
+                        end
+                    end
+                    if clicked and mx < action_x then load_history_item(it) end
                 end
             end
         end
     end
     raygui.end_scissor()
+    if hint then surface.tooltip(raygui, hint[1], hint[2], hint[3], hint[4], hint[5], bg, txt) end
 end
 
 -- Files: the active tab's working directory as an expandable tree. Children come
@@ -3138,7 +3238,10 @@ end
 
 local function __update()
     oauth_login.tick()
-    if raygui.should_close() or S.quit then xthread.stop(0); return end
+    if raygui.should_close() or S.quit then
+        if raygui.request_close then raygui.request_close() else xthread.stop(0) end
+        return
+    end
     local tab = T()
     if not tab then return end
 
@@ -3183,6 +3286,8 @@ local function __update()
         lx = SIDEBAR_W
         raygui.draw_rectangle(0, TOP, SIDEBAR_W, H - TOP, sb[1], sb[2], sb[3], sb[4])
         draw_history_sidebar(0, H, tab)
+        tab = T()
+        tab.view.lock_input = modal or nil
     end
     if show_panel then
         local x0 = W - SIDEBAR_W
@@ -3261,7 +3366,8 @@ local function __update()
     local new_input, submitted, new_edit
     new_input, new_edit, submitted = surface.editor(raygui, card_bg,
         composer_x, iy, composer_w, INPUT_H, tab.input,
-        (not modal and not answering) and tab.input_edit or false, true)
+        (not modal and not answering) and tab.input_edit or false, true,
+        ('composer:%s:%s'):format(tab.id or '', tab.sess and tab.sess.id or ''), modal or answering)
     -- The card owns keyboard input while waiting. Keep the original
     -- composer and its draft visible without letting a second editor consume keys.
     if not answering then tab.input = new_input end
@@ -3273,6 +3379,7 @@ local function __update()
 
     -- live / @ autocomplete menu, recomputed from the (possibly edited) input
     update_completion_menu()
+    if raygui.set_completion_keys then raygui.set_completion_keys(S.menu ~= nil) end
 
     if not S.dir_dialog and not answering then
         -- the toolbar's '+' / a file-tree click may have just focused the box

@@ -149,6 +149,14 @@ spec.describe('transcript.wrap', function()
         spec.equal(lines[1], 'a')
         spec.equal(lines[2], 'b')
     end)
+
+    spec.it('provides the separators for copying across visual rows', function()
+        local joins = {}
+        local lines = transcript.wrap('aaa bbb\n你好世界\n\nend', 30, measure, 0, joins)
+        local copied = {}
+        for i, line in ipairs(lines) do copied[i] = line .. (joins[i] or '') end
+        spec.equal(table.concat(copied), 'aaa bbb\n你好世界\n\nend')
+    end)
 end)
 
 spec.describe('markdown', function()

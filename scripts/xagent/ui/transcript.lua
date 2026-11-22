@@ -33,7 +33,7 @@ local function break_long(word, max_w, line, line_w, measure, spacing, out)
     return line, line_w
 end
 
-local function wrap_para(s, max_w, measure, spacing, out)
+local function wrap_para(s, max_w, measure, spacing, out, joins)
     local line, line_w = '', 0
     local space_w = measure(' ')
     for word in s:gmatch('%S+') do
@@ -47,6 +47,7 @@ local function wrap_para(s, max_w, measure, spacing, out)
                 line, line_w = line .. ' ' .. word, cand
             else
                 out[#out + 1] = line
+                if joins then joins[#out] = ' ' end
                 if ww <= max_w then line, line_w = word, ww
                 else line, line_w = break_long(word, max_w, '', 0, measure, spacing, out) end
             end
@@ -57,7 +58,7 @@ end
 
 -- wrap(text, max_width, measure [, spacing]) -> array of line strings.
 -- `measure(str)` returns pixel width; `spacing` is the per-glyph gap (TEXT_SPACING).
-function M.wrap(text, max_width, measure, spacing)
+function M.wrap(text, max_width, measure, spacing, joins)
     spacing = spacing or 0
     local out = {}
     local s = tostring(text or '')
@@ -65,8 +66,9 @@ function M.wrap(text, max_width, measure, spacing)
     while true do
         local nl = s:find('\n', start, true)
         local para = nl and s:sub(start, nl - 1) or s:sub(start)
-        if para == '' then out[#out + 1] = '' else wrap_para(para, max_width, measure, spacing, out) end
+        if para == '' then out[#out + 1] = '' else wrap_para(para, max_width, measure, spacing, out, joins) end
         if not nl then break end
+        if joins then joins[#out] = '\n' end
         start = nl + 1
     end
     return out
@@ -198,6 +200,7 @@ function View:entry_rows(entry, width)
                     color = M.card_colors.label, bg = ll.bg, code_header = ll.code, entry = entry }
             end
             local wrapped
+            local joins = self.rg.selection_line and {} or nil
             if ll.code then
                 -- Code whitespace is significant. The prose word wrapper collapses
                 -- indentation and repeated spaces, so wrap code by UTF-8 character.
@@ -205,10 +208,10 @@ function View:entry_rows(entry, width)
                 local tail = break_long(ll.text:gsub('\t', '    '), math.max(1, width - 16), '', 0, measure, spacing, wrapped)
                 wrapped[#wrapped + 1] = tail
             else
-                wrapped = M.wrap(ll.text, math.max(1, width), measure, spacing)
+                wrapped = M.wrap(ll.text, math.max(1, width), measure, spacing, joins)
             end
             local offset = 1
-            for _, sl in ipairs(wrapped) do
+            for index, sl in ipairs(wrapped) do
                 local first = ll.text:find(sl, offset, true) or offset
                 local bold_spans = {}
                 for _, span in ipairs(ll.bold_spans or {}) do
@@ -217,9 +220,13 @@ function View:entry_rows(entry, width)
                 end
                 offset = first + #sl
                 rows[#rows + 1] = { text = sl, color = ll.color, bg = ll.bg,
-                    bold = ll.bold, bold_spans = bold_spans, code = ll.code, entry = entry }
+                    bold = ll.bold, bold_spans = bold_spans, code = ll.code, entry = entry,
+                    selection_join = joins and (index == #wrapped and '\n' or joins[index] or '') }
             end
         end
+    end
+    if self.rg.selection_line then
+        for i, row in ipairs(rows) do row.selection_index = i end
     end
     self.cache[entry] = { width = width, len = #entry.text, rows = rows }
     return rows
@@ -421,6 +428,9 @@ function View:draw(entries, x, y, w, h)
     local bg = self.bg
     rg.draw_rectangle(x, y, w, h, bg[1], bg[2], bg[3], bg[4])
     rg.begin_scissor(x + 1, y + 1, w - 2, h - 2)
+    if rg.begin_selection and not self.lock_input then
+        rg.begin_selection(x + 1, y + 1, w - 2, h - 2)
+    end
     -- Paint whole message surfaces before the rows. Only visible spans are
     -- visited; rounded ends remain outside the viewport for long messages.
     if self.cards then
@@ -516,6 +526,10 @@ function View:draw(entries, x, y, w, h)
                 rg.draw_rectangle(cx, ly + self.line_h - 1, r.cell_width, 1, table.unpack(border))
                 rg.draw_rectangle(cx, ly, 1, self.line_h, table.unpack(border))
                 draw_text_runs(value, cx + 8, ly, r.color, r.table_header, nil, true)
+                if rg.selection_line and not self.lock_input then
+                    rg.selection_line(r.entry, r.selection_index, col, cx + 8, ly, self.font_size,
+                        value, col == #r.cells and '\n' or '\t')
+                end
             end
             rg.draw_rectangle(text_x + width - 1, ly, 1, self.line_h, table.unpack(border))
         elseif r.text and (r.text ~= '' or r.bg) then
@@ -533,12 +547,17 @@ function View:draw(entries, x, y, w, h)
                 draw_text_runs(r.text, draw_x, ly, r.color, r.bold, r.bold_spans, not r.code)
             end
         end
+        if rg.selection_line and not self.lock_input and r.selection_join then
+            rg.selection_line(r.entry, r.selection_index, 1, text_x + (r.bg and 8 or 0), ly,
+                self.font_size, r.text, r.selection_join)
+        end
     end
     rg.end_scissor()
 
     -- Fire a link click: press and release both landed on the same rect, the
     -- press didn't start on the scrollbar, and no modal is overlaying us.
-    if link_released and self.on_link and not self.lock_input and not self._press_on_sb then
+    if link_released and self.on_link and not self.lock_input and not self._press_on_sb
+        and not (rg.selection_dragged and rg.selection_dragged()) then
         local px, py = self.press_x or -1, self.press_y or -1
         for _, lk in ipairs(frame_links) do
             local over_rel = mx >= lk.x and mx <= lk.x + lk.w and my >= lk.y and my <= lk.y + lk.h

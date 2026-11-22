@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Codua WebView</title>
+<style>
+    :root { font-family: system-ui, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; }
+    body { margin: 0; overflow: hidden; background: #f2f5f2; }
+    #surface, #editors, #transcript-text { position: fixed; inset: 0; width: 100%; height: 100%; }
+    #surface { touch-action: none; }
+    #editors { pointer-events: none; }
+    #transcript-text { pointer-events: none; }
+    .transcript-line {
+        position: absolute; white-space: pre; color: transparent; pointer-events: auto;
+        cursor: text; user-select: text; -webkit-user-select: text;
+    }
+    .transcript-line::selection { background: #649cec62; color: transparent; }
+    #transcript-copy {
+        position: fixed; z-index: 1; padding: 6px 18px; font: inherit; cursor: pointer;
+        background: Canvas; color: CanvasText; border: 1px solid GrayText; border-radius: 7px;
+        box-shadow: 0 3px 10px #0002;
+    }
+    .editor {
+        position: absolute; box-sizing: border-box; margin: 0; border: 0; padding: 0 6px;
+        outline: none; resize: none; font-family: inherit; background: transparent;
+        pointer-events: auto; overflow: auto; border-radius: 0;
+    }
+    textarea.editor { padding-top: 4px; }
+    #feedback { position: fixed; inset: auto 16px 16px; margin: 0; padding: 12px; background: #fff; color: #812; }
+    dialog {
+        box-sizing: border-box; width: min(650px, calc(100% - 32px)); max-height: calc(100% - 32px);
+        border: 1px solid #b5c2b9; border-radius: 12px; background: #f8faf8; color: #24352a; padding: 18px;
+    }
+    dialog::backdrop { background: #17231d70; }
+    dialog h1 { margin: 0 0 12px; font-size: 18px; }
+    .folder-bar { display: flex; align-items: center; gap: 8px; margin: 10px 0; }
+    dialog input, dialog button { font: inherit; color: inherit; }
+    #folder-path { flex: 1; min-width: 0; padding: 6px; }
+    #folder-list { height: min(270px, 40vh); overflow: auto; border: 1px solid #cdd8d0; background: #fff; }
+    #folder-list button { display: block; width: 100%; text-align: left; border: 0; background: none; padding: 6px 12px; }
+    #folder-list button:hover, #folder-list button:focus-visible { background: #dfede4; }
+    .folder-actions { justify-content: flex-end; }
+    #folder-error { color: #812; margin: 8px 0; }
+</style>
+<canvas id="surface" aria-label="Codua 工作区"></canvas>
+<div id="transcript-text" aria-label="消息正文"></div>
+<div id="editors"></div>
+<button id="transcript-copy" type="button" hidden>复制</button>
+<p id="feedback" role="alert" hidden></p>
+<dialog id="folder-picker" aria-labelledby="folder-title">
+    <h1 id="folder-title">选择工作目录</h1>
+    <div class="folder-bar">
+        <button id="folder-up" type="button">上一级</button>
+        <input id="folder-path" aria-label="目录路径" spellcheck="false">
+        <button id="folder-go" type="button">打开</button>
+    </div>
+    <div id="folder-list"></div>
+    <p id="folder-error" role="alert" hidden></p>
+    <div class="folder-bar folder-actions">
+        <button id="folder-cancel" type="button">取消</button>
+        <button id="folder-select" type="button">选择此目录</button>
+    </div>
+</dialog>
+<script src="surface.js" defer></script>

@@ -316,25 +316,40 @@ function Session:to_table()
     }
 end
 
+local function read_record(path)
+    local data = fs.read_file(path)
+    local record = data and xutils.json_unpack(data)
+    return type(record) == 'table' and record or nil
+end
+
+local function write_record(path, record)
+    local encoded, encode_err = xutils.json_pack(record)
+    if not encoded then return nil, encode_err or 'session encoding failed' end
+    -- Write a sibling temp file and replace, so an interrupted write leaves the
+    -- last completed session intact instead of a truncated file.
+    local dir = path:match('^(.*)[/\\]') or '.'
+    local temporary = xutils.temp_file and xutils.replace_file and xutils.temp_file(dir)
+    if not temporary then return fs.write_file(path, encoded) end
+    local ok, err = fs.write_file(temporary, encoded)
+    if ok then ok, err = xutils.replace_file(temporary, path) end
+    if not ok then os.remove(temporary) end
+    return ok, err
+end
+
 -- Persist to <dir>/<id>.json (dir defaults to ~/.xagent/sessions). Returns path.
 function Session:save(dir)
     if not self:has_user_input() then return nil, 'empty session' end
     dir = dir or M.dir()
     fs.mkdirp(dir)
     local path = dir .. '/' .. self.id .. '.json'
-    local encoded, encode_err = xutils.json_pack(self:to_table())
-    if not encoded then return nil, encode_err or 'session encoding failed' end
-    -- Write a sibling temp file and replace, so an interrupted write leaves the
-    -- last completed session intact instead of a truncated file.
-    local temporary = xutils.temp_file and xutils.replace_file and xutils.temp_file(dir)
-    if not temporary then
-        local ok, err = fs.write_file(path, encoded)
-        if not ok then return nil, err end
-        return path
-    end
-    local ok, err = fs.write_file(temporary, encoded)
-    if ok then ok, err = xutils.replace_file(temporary, path) end
-    if not ok then os.remove(temporary); return nil, err end
+    local record = self:to_table()
+    -- History actions can run while this session is streaming in an open tab.
+    -- Keep the latest sidebar flags when the tab eventually saves its turn.
+    local saved = read_record(path)
+    if saved then record.pinned, record.archived = saved.pinned, saved.archived end
+    record.updated_at = os.time()
+    local ok, err = write_record(path, record)
+    if not ok then return nil, err end
     return path
 end
 
@@ -380,49 +395,55 @@ function M.load(path, opts)
     return s
 end
 
--- List ALL saved sessions, most-recent first. Returns { {id, path, created_at,
--- title, n}, ... }. Ids start with a hex timestamp, so a descending id sort is
--- recency order. (Reads every file once — callers should list on open, not per
--- frame.) `title` prefers a stored custom name, else the first user message.
+-- List all saved sessions by last conversation update, including archives.
+-- Reads every file once, so callers should refresh on changes rather than per frame.
 function M.list(dir)
     dir = dir or M.dir()
     local entries = xutils.scan_dir(dir)
     if not entries then return {} end
 
-    local files = {}
+    local items = {}
     for _, e in ipairs(entries) do
         local id = (e.rel or ''):match('([^/\\]+)%.json$')
-        if id then files[#files + 1] = { id = id, path = e.path } end
-    end
-    table.sort(files, function(a, b) return a.id > b.id end)
-
-    local items = {}
-    for _, f in ipairs(files) do
-        local data = fs.read_file(f.path)
-        local t = data and xutils.json_unpack(data)
-        if type(t) == 'table' and has_user_input(t) then
+        local t = id and read_record(e.path)
+        if t and has_user_input(t) then
             local title = (type(t.title) == 'string' and t.title ~= '') and t.title
                 or first_user_text(t.transcript or t.messages)
+            local created = tonumber(t.created_at) or 0
             items[#items + 1] = {
-                id = t.id or f.id,
-                path = f.path,
-                created_at = t.created_at or 0,
+                id = t.id or id,
+                path = e.path,
+                created_at = created,
+                updated_at = tonumber(t.updated_at) or created,
                 title = title,
                 cwd = t.cwd,
                 n = #(t.transcript or t.messages or {}),
+                pinned = t.pinned == true,
+                archived = t.archived == true,
             }
         end
     end
+    table.sort(items, function(a, b)
+        if a.updated_at ~= b.updated_at then return a.updated_at > b.updated_at end
+        return tostring(a.id) > tostring(b.id)
+    end)
     return items
 end
 
 -- Rename a saved session (writes a custom `title` into its file).
 function M.rename(path, new_title)
-    local data = fs.read_file(path)
-    local t = data and xutils.json_unpack(data)
-    if type(t) ~= 'table' then return nil, 'bad session file' end
+    local t = read_record(path)
+    if not t then return nil, 'bad session file' end
     t.title = tostring(new_title or '')
-    return fs.write_file(path, xutils.json_pack(t))
+    return write_record(path, t)
+end
+
+function M.set_history_flag(path, flag, enabled)
+    if flag ~= 'pinned' and flag ~= 'archived' then return nil, 'unknown history flag' end
+    local t = read_record(path)
+    if not t then return nil, 'bad session file' end
+    t[flag] = enabled and true or nil
+    return write_record(path, t)
 end
 
 -- Delete a saved session file.

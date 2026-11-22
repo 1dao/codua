@@ -10,8 +10,9 @@ local function test_history_groups()
     local file = assert(io.open('scripts/xagent/gui.lua', 'rb'))
     local source = file:read('*a'); file:close()
     local first = assert(source:find('local function build_history_groups(', 1, true))
-    local last = assert(source:find('local function draw_history_sidebar(', first, true))
-    local build_history_groups = assert(load(source:sub(first, last - 1) .. '\nreturn build_history_groups', '@gui-history-groups'))()
+    local helper_end = assert(source:find('local function history_icon(', first, true))
+    local build_history_groups, build_history_rows = assert(load(source:sub(first, helper_end - 1) ..
+        '\nreturn build_history_groups, build_history_rows', '@gui-history-groups'))()
     local items = {
         { id = 'a1', cwd = 'C:/work/alpha', title = 'Investigate parser' },
         { id = 'b1', cwd = 'C:/work/beta', title = 'Update settings' },
@@ -62,6 +63,33 @@ local function test_history_groups()
             groups, shown = build_history_groups(items, 'missing', false, {}, key)
             spec.equal(#groups, 0); spec.equal(shown, 0)
         end)
+        spec.it('puts pins first and keeps the active older conversation visible', function()
+            local project = {}
+            for i = 1, 9 do project[i] = { id = i, cwd = 'alpha', title = 'Input ' .. i, pinned = i == 8 } end
+            local groups = build_history_groups(project, '', false, {}, key)
+            local rows = build_history_rows(groups, {}, false, 9)
+            spec.equal(rows[2].value.id, 8)
+            spec.equal(rows[3].value.id, 1)
+            spec.equal(rows[7].value.id, 5)
+            spec.equal(rows[8].value.id, 9)
+            spec.equal(rows[9].value.hidden, 2)
+            rows = build_history_rows(groups, { alpha = true }, false)
+            spec.equal(rows[10].value.id, 9)
+            spec.truthy(rows[11].value.all)
+        end)
+        spec.it('searches older rows in the selected archive view and expands matches', function()
+            local records = {
+                { id = 'current', cwd = 'alpha', title = 'Parser fixes' },
+                { id = 'old', cwd = 'alpha', title = 'Parser notes', archived = true },
+            }
+            local groups, shown = build_history_groups(records, 'parser', true, { alpha = false }, key, true)
+            spec.equal(shown, 1)
+            spec.truthy(groups[1].expanded)
+            spec.equal(groups[1].items[1].id, 'old')
+            groups = build_history_groups(records, '', false, {}, key)
+            spec.equal(groups[1].items[1].id, 'current')
+            spec.equal(#groups[1].items, 1)
+        end)
     end)
 
     assert(spec.finish() == 0, "History grouping tests failed")
@@ -109,6 +137,19 @@ local function run()
     assert(loaded.transcript[1].content == '原始问题：保留这段历史')
     loaded.messages[1].content = 'again'; assert(loaded.transcript[1].content ~= 'again')
     print('PASS full transcript survives compaction, mutation, save and reload')
+
+    assert(session.set_history_flag(path, 'pinned', true))
+    assert(session.set_history_flag(path, 'archived', true))
+    assert(loaded:save(dir))  -- an open tab was loaded before both sidebar actions
+    local history_item
+    for _, item in ipairs(session.list(dir)) do if item.id == s.id then history_item = item; break end end
+    assert(history_item and history_item.pinned and history_item.archived)
+    assert(history_item.updated_at >= history_item.created_at)
+    assert(session.set_history_flag(path, 'archived', false))
+    for _, item in ipairs(session.list(dir)) do
+        if item.id == s.id then assert(item.pinned and not item.archived and item.updated_at == history_item.updated_at) end
+    end
+    print('PASS pin and archive survive saving an open session; restoring preserves its recency')
     local branch = loaded:fork()
     assert(branch.id ~= loaded.id and branch.parent_id == loaded.id)
     assert(branch.skill_id == loaded.skill_id and #branch.transcript == #loaded.transcript)

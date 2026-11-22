@@ -33,6 +33,7 @@ function M.composer_height(content_height)
 end
 
 function M.rounded(rg, x, y, w, h, radius, color)
+    if rg.draw_rounded_rectangle then return rg.draw_rounded_rectangle(x, y, w, h, radius, table.unpack(color)) end
     local r = math.max(0, math.floor(math.min(radius, w / 2, h / 2)))
     local function rect(rx, ry, rw, rh)
         if rw > 0 and rh > 0 then rg.draw_rectangle(rx, ry, rw, rh, table.unpack(color)) end
@@ -150,12 +151,12 @@ function M.icon_button(rg, x, y, w, h, kind, bg, ink)
     return clicked
 end
 
-function M.editor(rg, bg, x, y, w, h, value, edit, enter_sends)
+function M.editor(rg, bg, x, y, w, h, value, edit, enter_sends, editor_id, disabled)
     return styled(rg, rg.TEXTBOX, {
         [rg.BORDER_WIDTH] = 0,
         [rg.BASE_COLOR_NORMAL] = packed(bg), [rg.BASE_COLOR_FOCUSED] = packed(bg),
         [rg.BASE_COLOR_PRESSED] = packed(bg),
-    }, function() return rg.textbox_multi(x, y, w, h, value, edit, enter_sends) end)
+    }, function() return rg.textbox_multi(x, y, w, h, value, edit, enter_sends, editor_id, disabled) end)
 end
 
 function M.tooltip(rg, x, y, w, h, label, bg, ink)
