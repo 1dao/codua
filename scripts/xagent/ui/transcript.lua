@@ -444,6 +444,17 @@ function View:draw(entries, x, y, w, h)
     end
     local frame_links = {}                 -- clickable URL rects drawn this frame
     local measure = self:measure_fn()
+    -- Fake bold redraws the run one PHYSICAL pixel to the right. The native
+    -- renderer snaps every glyph to whole device pixels, so the old +0.6
+    -- logical offset rounded differently per glyph (some doubled, some not)
+    -- and read as a blurry ghost image. 1/(dpi*zoom) is exactly one device
+    -- pixel at any DPI/zoom, so every glyph in the run shifts uniformly.
+    local bold_dx = 1
+    if rg.display_info then
+        local info = rg.display_info()
+        local sx = (info.dpi_x or 1) * (info.ui_scale or 1)
+        if sx > 0 then bold_dx = 1 / sx end
+    end
     local function draw_text_runs(value, left, top, color, bold, spans, allow_links)
         local links = allow_links and self.on_link and find_links(value) or {}
         local boundaries = {1, #value + 1}
@@ -474,7 +485,7 @@ function View:draw(entries, x, y, w, h)
                 end
                 local run, draw_x = value:sub(first, last), position(first)
                 self:draw_line(run, draw_x, top, ink)
-                if strong then self:draw_line(run, draw_x + 0.6, top, ink) end
+                if strong then self:draw_line(run, draw_x + bold_dx, top, ink) end
             end
         end
         for _, link in ipairs(links) do
