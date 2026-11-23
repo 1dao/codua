@@ -158,10 +158,25 @@ function View:logical_lines(entry)
     return { { text = entry.text, color = entry.role == 'user' and markdown.palette.text or role_color(entry.role) } }
 end
 
--- Drop cached layout (call when colors/theme change so rows re-render).
+-- Forward declaration; defined after entry_rows below. invalidate() re-wraps the
+-- already-laid-out rows, so it needs the block builder.
+local entry_block
+
+-- Drop cached WRAPPING and re-wrap the laid-out rows in place (call when glyph
+-- measurements, colors or theme change). Resetting `layout` here was wrong: the
+-- old behaviour restarted the tail-first layout and reset follow/scroll, which
+-- snapped a scrolled-up view back to the bottom and made the scrollbar thumb
+-- oscillate. Re-wrapping preserves the incremental layout and the reader's place.
 function View:invalidate()
     self.cache = setmetatable({}, { __mode = 'k' })
-    self.layout = nil
+    local l = self.layout
+    if not l then return end
+    local rows = {}
+    for i = l.lo, l.hi do
+        local block = entry_block(self, l.entries[i], l.width)
+        for j = 1, #block do rows[#rows + 1] = block[j] end
+    end
+    l.rows = rows
 end
 
 -- Wrapped rows retain code, emphasis and table metadata. Cached by text length.
@@ -256,7 +271,7 @@ local function now_ms()
     return os.clock() * 1000
 end
 
-local function entry_block(self, entry, width)
+entry_block = function(self, entry, width)
     local block = {}
     if self.cards and (entry.role == 'user' or entry.role == 'assistant') then
         block[#block + 1] = { text = entry.role == 'user' and '你' or 'codua',
@@ -396,7 +411,10 @@ function View:draw(entries, x, y, w, h)
         if down and not self.prev_down and hot then            -- press edge
             self.sb_drag = (my >= ty and my <= ty + th) and (my - ty) or (th / 2)
         end
-        if self.sb_drag and down then                          -- dragging: map y → scroll
+        -- Map the pointer to scroll while held AND on the frame it is released.
+        -- Without the release pass, a quick press-drag-release that fits between
+        -- two rendered frames keeps the stale (bottom) scroll and snaps back.
+        if self.sb_drag and (down or self.prev_down) then
             local rel = trange > 0 and ((my - self.sb_drag - sb_y) / trange) or 0
             self.scroll = math.max(0, math.min(1, rel)) * max_scroll
             self.follow = false
@@ -408,7 +426,12 @@ function View:draw(entries, x, y, w, h)
     if self.follow then self.scroll = max_scroll end
     if self.scroll > max_scroll then self.scroll = max_scroll end
     if self.scroll < 0 then self.scroll = 0 end
-    if not self.anchor_top and self.scroll >= max_scroll - 1 then self.follow = true end
+    -- Re-arm tail-follow only when the user actually reaches the bottom, never
+    -- while a scrollbar drag is active: grabbing the thumb at the bottom must
+    -- disengage follow, not re-arm it on the same frame.
+    if not self.anchor_top and not self.sb_drag and self.scroll >= max_scroll - 1 then
+        self.follow = true
+    end
 
     -- which message is the pointer over? the copy button shows on hover only
     local hover_entry

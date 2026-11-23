@@ -183,10 +183,12 @@ local function refresh_display()
     S.display = surface.adapt_display(raygui, S.ui_scale)
     local display = S.display
     if previous and display and (previous.ui_scale ~= display.ui_scale
-        or previous.dpi_x ~= display.dpi_x or previous.dpi_y ~= display.dpi_y
-        or previous.metrics_revision ~= display.metrics_revision) then
+        or previous.dpi_x ~= display.dpi_x or previous.dpi_y ~= display.dpi_y) then
         -- Rerasterized glyphs can have slightly different metrics even when the
         -- window's logical width stays unchanged after a monitor/DPI change.
+        -- (The WebView's async glyph-measurement `metrics_revision` is deliberately
+        -- NOT included: it changes every frame while the browser streams measured
+        -- widths, and invalidating on it made the transcript re-layout and snap.)
         for _, tab in ipairs(S.tabs) do tab.view:invalidate() end
         if S.log_view then S.log_view:invalidate() end
     end

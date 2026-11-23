@@ -91,6 +91,70 @@ spec.describe('transcript tail-follow mechanics', function()
         spec.truthy(view.follow)
         spec.truthy(tail_drawn(calls3, tail), 're-armed follow must bring the tail back into view')
     end)
+
+    spec.it('scrollbar drag to the top stays put even when release is the very next frame', function()
+        -- Stateful pointer/button double to simulate press -> (dropped frames) -> release.
+        local st = { mx = -1, my = -1, down = false }
+        local calls = {}
+        local rg = {
+            measure_text = function(s) return #s * 8 end,
+            get_mouse = function() return st.mx, st.my end,
+            get_wheel = function() return 0 end,
+            mouse_down = function() return st.down end,
+            draw_rectangle = function() end,
+            begin_scissor = function() end,
+            end_scissor = function() end,
+            draw_text = function(text, x, y) calls[#calls + 1] = { text = text, y = y } end,
+            BUTTON = 1, BORDER_WIDTH = 2, BASE_COLOR_NORMAL = 3, BASE_COLOR_FOCUSED = 4,
+            BASE_COLOR_PRESSED = 5, TEXT_COLOR_NORMAL = 6, TEXT_COLOR_FOCUSED = 7,
+            TEXT_COLOR_PRESSED = 8,
+            get_style = function() return 0 end,
+            set_style = function() end,
+            button = function() return false end,
+        }
+        local entries = {}
+        for i = 1, 20 do
+            entries[#entries + 1] = { role = 'assistant',
+                text = string.rep('line ' .. i .. ' word word word word\n', 8) }
+        end
+        local tail = 'line 20 word word word word'
+        local view = transcript.new_view({ raygui = rg, font_size = 16 })
+        view:draw(entries, 0, 0, 400, 300)
+        spec.truthy(view.follow, 'starts following the tail')
+
+        -- Grab the thumb at the bottom, then release at the top with NO
+        -- intermediate rendered frame (fast drag / dropped frames while streaming).
+        st.down = true; st.mx = 395; st.my = 292
+        view:draw(entries, 0, 0, 400, 300)
+        st.down = false; st.my = 4
+        calls = {}
+        view:draw(entries, 0, 0, 400, 300)
+        spec.equal(view.follow, false, 'releasing a drag at the top must not re-arm follow')
+        spec.equal(tail_drawn(calls, tail), false, 'the streaming tail must stay off-screen')
+    end)
+
+    spec.it('a metrics refresh (invalidate) keeps the reader scrolled-up place', function()
+        -- WebView streams glyph measurements in every frame; gui.lua responds by
+        -- calling view:invalidate(). That must re-wrap without teleporting the view.
+        local entries = {}
+        for i = 1, 4 do
+            entries[#entries + 1] = { role = 'assistant',
+                text = string.rep('line ' .. i .. ' word word word word\n', 10) }
+        end
+        local view = transcript.new_view({ raygui = adapter(0, false), font_size = 16 })
+        view:draw(entries, 0, 0, 400, 300)
+        view.rg = adapter(10, true)                 -- wheel up into history
+        view:draw(entries, 0, 0, 400, 300)
+        spec.equal(view.follow, false)
+        local parked = view.scroll
+        spec.truthy(parked > 0, 'parked away from the tail')
+
+        view.rg = adapter(0, false)
+        view:invalidate()                           -- metrics_revision changed
+        view:draw(entries, 0, 0, 400, 300)
+        spec.equal(view.follow, false, 'a metrics refresh must not re-arm tail-follow')
+        spec.equal(view.scroll, parked, 'a metrics refresh must keep the scroll position')
+    end)
 end)
 
 local failed = spec.finish()
