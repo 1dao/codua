@@ -365,6 +365,10 @@ local function T() return S.tabs[S.active] end
 local function add(tab, role, text)
     local e = { role = role, text = text or '' }
     tab.entries[#tab.entries + 1] = e
+    -- A fresh user message puts attention back on the latest exchange: re-arm
+    -- tail-follow even if the user had scrolled up to read history, so the new
+    -- question and its streaming answer are visible without manual scrolling.
+    if role == 'user' and tab.view then tab.view.follow = true end
     return e
 end
 
