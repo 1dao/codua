@@ -55,7 +55,12 @@ local function handle(conn, req)
     local ok, result = pcall(function()
         surface.prepare(state)
         gui.__update()
-        return xutils.json_pack(surface.response())
+        -- json_pack returns nil+err (it does NOT throw) on e.g. invalid UTF-8.
+        -- Passing nil through would send a 200 with an EMPTY body, and the
+        -- browser's response.json() dies with "Unexpected end of JSON input".
+        local packed, err = xutils.json_pack(surface.response())
+        if not packed then error('frame json_pack: ' .. tostring(err), 0) end
+        return packed
     end)
     if not ok then
         io.stderr:write('Codua WebView frame: ', tostring(result), '\n')

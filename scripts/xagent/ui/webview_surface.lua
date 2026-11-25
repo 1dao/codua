@@ -3,6 +3,17 @@
 local xutils = require('xutils')
 local fs = dofile('scripts/core/share/xfs.lua')
 local xpath = dofile('scripts/core/share/xpath.lua')
+local xtext = dofile('scripts/core/share/xtext.lua')
+
+-- The frame is serialized with json_pack, which rejects invalid UTF-8 by
+-- returning nil (the whole frame would go out empty). Native raygui draws
+-- stray bytes harmlessly, so display strings can carry them (byte-cut CJK,
+-- binary tool output). Repair at the WebView boundary; the utf8.len fast
+-- path keeps clean strings allocation-free.
+local function clean(s)
+    if type(s) ~= 'string' or utf8.len(s) then return s end
+    return xtext.valid_utf8(s)
+end
 
 local M = {}
 local styles = {}
@@ -142,7 +153,7 @@ function M.draw_rounded_rectangle(x, y, w, h, radius, r, g, b, a)
 end
 
 function M.draw_text(value, x, y, size, r, g, b, a)
-    draw('text', x, y, size, color(r, g, b, a), value)
+    draw('text', x, y, size, color(r, g, b, a), clean(value))
 end
 
 function M.begin_selection(x, y, w, h)
@@ -158,7 +169,7 @@ function M.selection_line(entry, row, column, x, y, size, value, join)
         selection_ids[entry] = id
     end
     local lines = frame.selection.lines
-    lines[#lines + 1] = { id .. ':' .. row .. ':' .. column, x, y, size, value, join }
+    lines[#lines + 1] = { id .. ':' .. row .. ':' .. column, x, y, size, clean(value), join }
 end
 
 function M.selection_dragged()
@@ -176,6 +187,7 @@ function M.end_scissor()
 end
 
 function M.measure_text(value, size)
+    value = clean(value)
     size = size or M.get_style(M.DEFAULT, M.TEXT_SIZE)
     local measured = metrics[size] and metrics[size][value]
     if measured then return measured end
@@ -206,7 +218,7 @@ function M.button(x, y, w, h, value)
     local over = not locked and contains(x, y, w, h)
     local state = over and (mouse.down and 'PRESSED' or 'FOCUSED') or 'NORMAL'
     local border = M.get_style(M.BUTTON, M.BORDER_WIDTH)
-    draw('button', x, y, w, h, M.get_style(M.DEFAULT, M.TEXT_SIZE), icon_labels[value] or value,
+    draw('button', x, y, w, h, M.get_style(M.DEFAULT, M.TEXT_SIZE), icon_labels[value] or clean(value),
         M.get_style(M.BUTTON, 'BASE_COLOR_' .. state), M.get_style(M.BUTTON, 'BORDER_COLOR_' .. state),
         M.get_style(M.BUTTON, 'TEXT_COLOR_' .. state), border, M.get_style(M.BUTTON, M.TEXT_ALIGNMENT),
         M.get_style(M.BUTTON, M.TEXT_PADDING))
@@ -214,7 +226,7 @@ function M.button(x, y, w, h, value)
 end
 
 function M.label(x, y, w, h, value)
-    draw('label', x, y, w, h, M.get_style(M.DEFAULT, M.TEXT_SIZE), M.get_style(M.DEFAULT, M.TEXT_COLOR_NORMAL), value)
+    draw('label', x, y, w, h, M.get_style(M.DEFAULT, M.TEXT_SIZE), M.get_style(M.DEFAULT, M.TEXT_COLOR_NORMAL), clean(value))
 end
 
 function M.set_textbox_cursor(position) caret = position end
@@ -245,14 +257,14 @@ local function textbox(x, y, w, h, value, edit, multiline, enter_sends, id, disa
                 box = box[5]
             end
             if left < right and top < bottom then
-                frame.editors[#frame.editors + 1] = { id = id, x = x, y = y, w = w, h = h, text = value,
+                frame.editors[#frame.editors + 1] = { id = id, x = x, y = y, w = w, h = h, text = clean(value),
                     size = size, ink = ink, focused = not not edit, multiline = multiline, enter_sends = enter_sends, label = label,
                     caret = id:sub(1, 9) == 'composer:' and caret or nil,
                     clip = { top - y, x + w - right, y + h - bottom, left - x } }
                 if id:sub(1, 9) == 'composer:' then caret = nil end
             end
         elseif value ~= '' then
-            draw('label', x + 6, y, w - 12, h, size, ink, value)
+            draw('label', x + 6, y, w - 12, h, size, ink, clean(value))
         end
     end
     return value, editable and not not edit, editable and event and event.submit == true

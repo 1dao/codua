@@ -95,15 +95,21 @@ M.card_colors = {
 }
 
 -- find_links(s) -> { { s=byte_start, e=byte_end, url=string }, … } for each
--- scheme://… run in `s`. URL chars are ASCII, so byte offsets are also valid
--- UTF-8 boundaries (safe for s:sub on mixed CJK lines). Trailing sentence
--- punctuation is trimmed so "…：http://x/y.html。" links just the URL.
-local TRAIL = '[%)%]%}>,%.;:!%?，。、）】！？”’]+$'
+-- scheme://… run in `s`. The URL body is matched with an ASCII-only RFC 3986
+-- charset, so it stops at the first CJK byte and byte offsets are always valid
+-- UTF-8 boundaries (safe for s:sub on mixed CJK lines). The old `%S+` body
+-- swallowed CJK text after the URL, and the byte-class TRAIL trim could then
+-- cut a multi-byte char in half (e.g. "http://x/一" → lone 0xE4), producing
+-- invalid UTF-8 that json_pack rejects — the WebView frame went out empty.
+-- Trailing ASCII sentence punctuation is trimmed so "…:http://x/y.html." links
+-- just the URL; CJK punctuation is never captured in the first place.
+local TRAIL = '[%)%]%}>,%.;:!%?]+$'
+local URL_BODY = "[%w%.%-_~:/?#%[%]@!$&'()*+,;=%%]+"
 local function find_links(s)
     local out, init = {}, 1
     s = tostring(s or '')
     while true do
-        local a, b = s:find('%a[%w%+%.%-]*://%S+', init)
+        local a, b = s:find('%a[%w%+%.%-]*://' .. URL_BODY, init)
         if not a then break end
         local url = s:sub(a, b)
         local trimmed = url:gsub(TRAIL, '')
