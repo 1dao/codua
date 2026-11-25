@@ -101,5 +101,21 @@ spec.describe('available window space', function()
     end)
 end)
 
+spec.describe('WebView clipboard', function()
+    spec.it('repairs invalid UTF-8 without changing valid clipboard text', function()
+        local webview = require('xagent.ui.webview_surface')
+        local xutils = require('xutils')
+        for _, case in ipairs({
+            { '原文\n一', '原文\n一' },
+            { '原文' .. string.char(0xFF) .. '\n一', '原文�\n一' },
+        }) do
+            webview.prepare({})
+            webview.set_clipboard(case[1])
+            local frame = xutils.json_unpack(assert(xutils.json_pack(webview.response())))
+            spec.equal(frame.clipboard, case[2])
+        end
+    end)
+end)
+
 local failed = spec.finish()
 return { __init = function() if failed > 0 then os.exit(1) end; xthread.stop(0) end }

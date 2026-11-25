@@ -95,26 +95,29 @@ M.card_colors = {
 }
 
 -- find_links(s) -> { { s=byte_start, e=byte_end, url=string }, … } for each
--- scheme://… run in `s`. The URL body is matched with an ASCII-only RFC 3986
--- charset, so it stops at the first CJK byte and byte offsets are always valid
--- UTF-8 boundaries (safe for s:sub on mixed CJK lines). The old `%S+` body
--- swallowed CJK text after the URL, and the byte-class TRAIL trim could then
--- cut a multi-byte char in half (e.g. "http://x/一" → lone 0xE4), producing
--- invalid UTF-8 that json_pack rejects — the WebView frame went out empty.
--- Trailing ASCII sentence punctuation is trimmed so "…:http://x/y.html." links
--- just the URL; CJK punctuation is never captured in the first place.
-local TRAIL = '[%)%]%}>,%.;:!%?]+$'
-local URL_BODY = "[%w%.%-_~:/?#%[%]@!$&'()*+,;=%%]+"
+-- scheme://… run in `s`. Keep Unicode host and path characters, and trim
+-- sentence punctuation as whole characters so draw runs stay valid UTF-8.
+local TRAIL = {
+    [')'] = true, [']'] = true, ['}'] = true, ['>'] = true, [','] = true,
+    ['.'] = true, [';'] = true, [':'] = true, ['!'] = true, ['?'] = true,
+    ['，'] = true, ['。'] = true, ['、'] = true, ['）'] = true, ['】'] = true,
+    ['！'] = true, ['？'] = true, ['”'] = true, ['’'] = true,
+}
+local URL_BODY = "[%w%.%-_~:/?#%[%]@!$&'()*+,;=%%\128-\255]+"
 local function find_links(s)
     local out, init = {}, 1
     s = tostring(s or '')
     while true do
-        local a, b = s:find('%a[%w%+%.%-]*://' .. URL_BODY, init)
+        local a, b, body = s:find('%a[%w%+%.%-]*://()' .. URL_BODY, init)
         if not a then break end
-        local url = s:sub(a, b)
-        local trimmed = url:gsub(TRAIL, '')
-        if #trimmed > 0 then
-            out[#out + 1] = { s = a, e = a + #trimmed - 1, url = trimmed }
+        local last = b
+        while last >= body do
+            local first = utf8.offset(s, -1, last + 1)
+            if not TRAIL[s:sub(first, last)] then break end
+            last = first - 1
+        end
+        if last >= body then
+            out[#out + 1] = { s = a, e = last, url = s:sub(a, last) }
         end
         init = b + 1
     end

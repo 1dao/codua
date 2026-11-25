@@ -64,5 +64,27 @@ spec.describe('transcript fake bold', function()
     end)
 end)
 
+spec.describe('transcript links', function()
+    spec.it('keeps Unicode URLs and splits trailing punctuation at character boundaries', function()
+        local url = 'https://例子.example/中文/一'
+        local prefix, suffix = '见：', '。！).'
+        local text = prefix .. url .. suffix .. ' http://x/一'
+        local links = transcript.find_links(text)
+        spec.equal(#links, 2)
+        spec.equal(links[1].url, url)
+        spec.equal(links[1].s, #prefix + 1)
+        spec.equal(links[1].e, #prefix + #url)
+        spec.equal(text:sub(links[1].e + 1, links[2].s - 1), suffix .. ' ')
+        spec.equal(links[2].url, 'http://x/一')
+    end)
+
+    spec.it('preserves percent-encoded paths and skips punctuation-only link bodies', function()
+        local url = 'https://example.com/%E4%B8%80?q=1'
+        local links = transcript.find_links('http://。 ' .. url .. '!')
+        spec.equal(#links, 1)
+        spec.equal(links[1].url, url)
+    end)
+end)
+
 local failed = spec.finish()
 return { __init = function() if failed > 0 then os.exit(1) end; xthread.stop(0) end }

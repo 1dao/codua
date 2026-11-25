@@ -132,7 +132,7 @@ function M.mouse_down() return mouse.down end
 function M.get_wheel() return bounded(input.wheel, -30, 30, 0) end
 function M.is_key_pressed(key) return input.keys and input.keys[key] == true end
 function M.set_mouse_cursor(shape) cursor = shape == 4 and 'pointer' or 'default' end
-function M.set_clipboard(value) frame.clipboard = value end
+function M.set_clipboard(value) frame.clipboard = clean(value) end
 function M.set_completion_keys(value) frame.completion = value end
 function M.lock() locked = true end
 function M.unlock() locked = false end
