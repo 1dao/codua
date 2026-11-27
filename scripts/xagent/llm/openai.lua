@@ -409,7 +409,9 @@ function M.new_decoder(cb)
                 self.blocks[#self.blocks + 1] = self.think_block
                 self.text_block = nil
             end
-            self.think_block.thinking = self.think_block.thinking .. reasoning
+            local p = self.think_block._kp
+            if not p then p = {}; self.think_block._kp = p end
+            p[#p + 1] = reasoning
         end
 
         -- A refusal streams in its own field instead of content; show it like
@@ -424,7 +426,10 @@ function M.new_decoder(cb)
                 self.blocks[#self.blocks + 1] = self.text_block
                 self.think_block = nil
             end
-            self.text_block.text = self.text_block.text .. text
+            -- Rope: per-delta concat is quadratic in the answer size.
+            local p = self.text_block._tp
+            if not p then p = {}; self.text_block._tp = p end
+            p[#p + 1] = text
             if cb.on_text then cb.on_text(text) end
         end
 
@@ -466,6 +471,10 @@ function M.new_decoder(cb)
                     'the connection was probably dropped')
             end
             return
+        end
+        for _, b in ipairs(self.blocks) do
+            if b._tp then b.text = (b.text or '') .. table.concat(b._tp); b._tp = nil end
+            if b._kp then b.thinking = (b.thinking or '') .. table.concat(b._kp); b._kp = nil end
         end
         for _, i in ipairs(self.tool_order) do
             local slot = self.tools[i]

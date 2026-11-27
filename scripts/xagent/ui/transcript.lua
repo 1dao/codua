@@ -178,6 +178,7 @@ local entry_block
 -- oscillate. Re-wrapping preserves the incremental layout and the reader's place.
 function View:invalidate()
     self.cache = setmetatable({}, { __mode = 'k' })
+    self.live_cache = nil
     local l = self.layout
     if not l then return end
     local rows = {}
@@ -189,9 +190,22 @@ function View:invalidate()
 end
 
 -- Wrapped rows retain code, emphasis and table metadata. Cached by text length.
+-- Within one entry+width, wrapped rows are ALSO cached per logical line so a
+-- streaming (growing) entry only re-wraps its changed tail: the stable prefix
+-- lines hit the line cache instead of re-wrapping the whole answer every frame.
+local LINE_CACHE_MAX = 4096
+local LINE_CACHE_BYTES = 2000000
+local LINE_CACHE_ROWS = 20000
 function View:entry_rows(entry, width)
     local c = self.cache[entry]
     if c and c.width == width and c.len == #entry.text then return c.rows end
+    local prev = c
+    local line_cache, lc_count, lc_bytes, lc_rows
+    if prev and prev.width == width and prev.line_cache then
+        line_cache, lc_count, lc_bytes, lc_rows = prev.line_cache, prev.lc_count or 0, prev.lc_bytes or 0, prev.lc_rows or 0
+    else
+        line_cache, lc_count, lc_bytes, lc_rows = {}, 0, 0, 0
+    end
     local measure = self:measure_fn()
     local spacing = 0
     pcall(function()
@@ -200,7 +214,7 @@ function View:entry_rows(entry, width)
     local rows = {}
     local logical = self:logical_lines(entry)
     local table_header = true
-    for _, ll in ipairs(logical) do
+    for li, ll in ipairs(logical) do
         if ll.cells then
             if not ll.separator then
                 local cell_width = width / math.max(1, #ll.cells)
@@ -223,36 +237,60 @@ function View:entry_rows(entry, width)
                 rows[#rows + 1] = { text = ll.code.language ~= '' and ll.code.language or '代码',
                     color = M.card_colors.label, bg = ll.bg, code_header = ll.code, entry = entry }
             end
-            local wrapped
-            local joins = self.rg.selection_line and {} or nil
-            if ll.code then
-                -- Code whitespace is significant. The prose word wrapper collapses
-                -- indentation and repeated spaces, so wrap code by UTF-8 character.
-                wrapped = {}
-                local tail = break_long(ll.text:gsub('\t', '    '), math.max(1, width - 16), '', 0, measure, spacing, wrapped)
-                wrapped[#wrapped + 1] = tail
-            else
-                wrapped = M.wrap(ll.text, math.max(1, width), measure, spacing, joins)
-            end
             local offset = 1
-            for index, sl in ipairs(wrapped) do
-                local first = ll.text:find(sl, offset, true) or offset
-                local bold_spans = {}
-                for _, span in ipairs(ll.bold_spans or {}) do
-                    local a, b = math.max(first, span.first), math.min(first + #sl - 1, span.last)
-                    if a <= b then bold_spans[#bold_spans + 1] = { first = a - first + 1, last = b - first + 1 } end
+            local joins = self.rg.selection_line and {} or nil
+            local kind = (ll.code and 'c' or (joins and 's' or 'w')) .. (ll.bold and 'b' or '')
+            local key = kind .. ll.text
+            local cached = line_cache[key]
+            -- The LAST logical line of a still-growing entry is re-keyed by every
+            -- delta (a single-paragraph answer IS one logical line). Caching those
+            -- growing prefixes retains a quadratic copy of the answer per turn, so
+            -- only closed lines — or a settled entry — enter the line cache.
+            local cacheable = li < #logical or (prev and prev.len == #entry.text and prev.width == width)
+            if not cached then
+                cached = {}
+                local wrapped
+                if ll.code then
+                    -- Code whitespace is significant. The prose word wrapper collapses
+                    -- indentation and repeated spaces, so wrap code by UTF-8 character.
+                    wrapped = {}
+                    local tail = break_long(ll.text:gsub('\t', '    '), math.max(1, width - 16), '', 0, measure, spacing, wrapped)
+                    wrapped[#wrapped + 1] = tail
+                else
+                    wrapped = M.wrap(ll.text, math.max(1, width), measure, spacing, joins)
                 end
-                offset = first + #sl
-                rows[#rows + 1] = { text = sl, color = ll.color, bg = ll.bg,
-                    bold = ll.bold, bold_spans = bold_spans, code = ll.code, entry = entry,
-                    selection_join = joins and (index == #wrapped and '\n' or joins[index] or '') }
+                for index, sl in ipairs(wrapped) do
+                    local first = ll.text:find(sl, offset, true) or offset
+                    local bold_spans = {}
+                    for _, span in ipairs(ll.bold_spans or {}) do
+                        local a, b = math.max(first, span.first), math.min(first + #sl - 1, span.last)
+                        if a <= b then bold_spans[#bold_spans + 1] = { first = a - first + 1, last = b - first + 1 } end
+                    end
+                    offset = first + #sl
+                    cached[#cached + 1] = { text = sl, color = ll.color, bg = ll.bg,
+                        bold = ll.bold, bold_spans = bold_spans, code = ll.code, entry = entry,
+                        selection_join = joins and (index == #wrapped and '\n' or joins[index] or '') }
+                end
+                if cacheable then
+                    -- A mid-stream unclosed fence re-keys the whole code line each
+                    -- delta; cap the cache so that cannot grow quadratically.
+                    if lc_count >= LINE_CACHE_MAX or lc_bytes >= LINE_CACHE_BYTES or lc_rows >= LINE_CACHE_ROWS then
+                        line_cache, lc_count, lc_bytes, lc_rows = {}, 0, 0, 0
+                    end
+                    line_cache[key] = cached
+                    lc_count = lc_count + 1
+                    lc_bytes = lc_bytes + #ll.text
+                    lc_rows = lc_rows + #cached
+                end
             end
+            for i = 1, #cached do rows[#rows + 1] = cached[i] end
         end
     end
     if self.rg.selection_line then
         for i, row in ipairs(rows) do row.selection_index = i end
     end
-    self.cache[entry] = { width = width, len = #entry.text, rows = rows }
+    self.cache[entry] = { width = width, len = #entry.text, rows = rows,
+        line_cache = line_cache, lc_count = lc_count, lc_bytes = lc_bytes, lc_rows = lc_rows }
     return rows
 end
 
@@ -382,8 +420,21 @@ function View:draw(entries, x, y, w, h)
         self:layout_backward_until(entries, width, #l.rows + 30, 2)
     end
 
-    -- The live (last) entry is re-laid-out every frame so streaming updates now.
-    local live = (#entries >= 1) and entry_block(self, entries[#entries], width) or {}
+    -- The live (last) entry grows during streaming. Re-render it at most every
+    -- 250ms (a full markdown+wrap pass is O(answer size)); between renders the
+    -- previous rows stay on screen, so the tail lags by at most one interval.
+    local live = {}
+    local live_entry = entries[#entries]
+    if live_entry then
+        local lc = self.live_cache
+        local t = now_ms()
+        if lc and lc.entry == live_entry and lc.width == width and t - lc.at < 250 then
+            live = lc.rows
+        else
+            live = entry_block(self, live_entry, width)
+            self.live_cache = { entry = live_entry, width = width, at = t, rows = live }
+        end
+    end
     local n_stable = #l.rows
     local total = n_stable + #live
     local function row_at(i)

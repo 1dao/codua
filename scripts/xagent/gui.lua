@@ -456,7 +456,14 @@ local function utf8_split_complete(s)
 end
 
 local function flush_tail(tab)
-    if tab.cur and tab.text_tail ~= '' then tab.cur.text = tab.cur.text .. tab.text_tail end
+    local cur = tab.cur
+    if cur then
+        local pending = cur._parts and table.concat(cur._parts) or ''
+        if pending ~= '' or tab.text_tail ~= '' then
+            cur.text = cur.text .. pending .. tab.text_tail
+        end
+        cur._parts, cur._parts_len = nil, 0
+    end
     tab.text_tail = ''
     tab.cur = nil
 end
@@ -466,7 +473,19 @@ local function on_event(tab, ev)
         if not tab.cur then tab.cur = add(tab, 'assistant', '') end
         local complete, tail = utf8_split_complete(tab.text_tail .. ev.text)
         tab.text_tail = tail
-        tab.cur.text = tab.cur.text .. complete
+        if complete ~= '' then
+            -- Rope + batched join: `text = text .. delta` per delta is quadratic
+            -- in the answer size (GBs of transient copies per long turn).
+            local cur = tab.cur
+            local p = cur._parts
+            if not p then p = {}; cur._parts = p end
+            p[#p + 1] = complete
+            cur._parts_len = (cur._parts_len or 0) + #complete
+            if cur._parts_len >= 65536 or #p >= 128 then
+                cur.text = cur.text .. table.concat(p)
+                cur._parts, cur._parts_len = nil, 0
+            end
+        end
     elseif ev.type == 'tool_use' then
         flush_tail(tab)
         add(tab, 'tool', '> ' .. ev.name .. '  ' .. compact(ev.input))

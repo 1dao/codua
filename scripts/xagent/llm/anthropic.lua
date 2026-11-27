@@ -252,6 +252,7 @@ function M.new_decoder(cb, cfg)
     local self = {
         blocks = {},          -- index(0-based) -> content block
         tool_json = {},       -- index -> accumulated input_json string
+        tool_json_parts = {}, -- index -> pending input_json pieces (rope)
         open_blocks = {},
         max_index = -1,
         usage = { input_tokens = 0, output_tokens = 0 },
@@ -318,18 +319,35 @@ function M.new_decoder(cb, cfg)
             local d = ev.delta or {}
             if d.type == 'text_delta' then
                 local b = self.blocks[i]
-                if b then b.text = (b.text or '') .. (d.text or '') end
+                -- Rope: per-delta `text = text .. delta` is quadratic in the
+                -- answer size (GBs of transient copies per turn); collect pieces
+                -- and join once at content_block_stop.
+                if b then
+                    local p = b._tp
+                    if not p then p = {}; b._tp = p end
+                    p[#p + 1] = d.text or ''
+                end
                 if cb.on_text then cb.on_text(d.text or '') end
             elseif d.type == 'input_json_delta' then
-                self.tool_json[i] = (self.tool_json[i] or '') .. (d.partial_json or '')
+                local p = self.tool_json_parts[i]
+                if not p then p = {}; self.tool_json_parts[i] = p end
+                p[#p + 1] = d.partial_json or ''
                 local b = self.blocks[i]
                 if b and cb.on_tool_input then cb.on_tool_input(b.id, d.partial_json or '') end
             elseif d.type == 'thinking_delta' then
                 local b = self.blocks[i]
-                if b then b.thinking = (b.thinking or '') .. (d.thinking or '') end
+                if b then
+                    local p = b._kp
+                    if not p then p = {}; b._kp = p end
+                    p[#p + 1] = d.thinking or ''
+                end
             elseif d.type == 'signature_delta' then
                 local b = self.blocks[i]
-                if b then b.signature = (b.signature or '') .. (d.signature or '') end
+                if b then
+                    local p = b._sp
+                    if not p then p = {}; b._sp = p end
+                    p[#p + 1] = d.signature or ''
+                end
             end
 
         elseif t == 'content_block_stop' then
@@ -337,6 +355,15 @@ function M.new_decoder(cb, cfg)
             if i == nil then return end
             self.open_blocks[i] = nil
             local b = self.blocks[i]
+            if b then
+                if b._tp then b.text = (b.text or '') .. table.concat(b._tp); b._tp = nil end
+                if b._kp then b.thinking = (b.thinking or '') .. table.concat(b._kp); b._kp = nil end
+                if b._sp then b.signature = (b.signature or '') .. table.concat(b._sp); b._sp = nil end
+            end
+            if self.tool_json_parts[i] then
+                self.tool_json[i] = (self.tool_json[i] or '') .. table.concat(self.tool_json_parts[i])
+                self.tool_json_parts[i] = nil
+            end
             if b and b.type == 'tool_use' and self.tool_json[i] ~= '' then
                 b.input = common.parse_tool_input(self.tool_json[i], b.name)
             end
