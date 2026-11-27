@@ -36,17 +36,30 @@ local function rpc_error(id, code, message)
     return xutils.json_pack({ jsonrpc = '2.0', id = id, error = { code = code, message = message } })
 end
 
--- Returns (body, extra_header_lines) for a decoded JSON-RPC request, or nil for
--- a notification (no response body).
-local function dispatch(req)
+-- The session the server currently accepts; tests rotate it to simulate a
+-- server restart (stale sessions must get HTTP 404, per the spec).
+local current_session = 'sess-abc'
+-- When true the server is "still restarting": initialize gets 503. init_count
+-- lets the test assert the cooldown window makes NO network attempt.
+local server_down, init_count = false, 0
+
+-- Returns (body, extra_header_lines, status) for a decoded JSON-RPC request,
+-- or nil for a notification (no response body).
+local function dispatch(req, session)
     local id, method, params = req.id, req.method, req.params or {}
     if id == nil then return nil end                  -- notification: 202, no body
     if method == 'initialize' then
+        init_count = init_count + 1
+        if server_down then
+            return '{"error":{"message":"server restarting"}}', nil, 503
+        end
         return rpc_result(id, {
             protocolVersion = '2025-06-18',
             capabilities = { tools = {}, resources = {} },
             serverInfo = { name = 'loopback-mcp', version = '0.0.1' },
-        }), 'Mcp-Session-Id: sess-abc\r\n'
+        }), 'Mcp-Session-Id: ' .. current_session .. '\r\n'
+    elseif session ~= current_session then
+        return '{"error":{"message":"Session not found"}}', nil, 404
     elseif method == 'tools/list' then
         return rpc_result(id, { tools = { {
             name = 'echo', description = 'Echo a message back',
@@ -83,12 +96,16 @@ local function make_server()
         bufs[conn] = nil
 
         local body = buf:sub(body_start, body_start + clen - 1)
+        local session = head:lower():match('mcp%-session%-id:%s*([^\r\n]+)')
         local ok, req = pcall(xutils.json_unpack, body)
-        local resp_body, extra
-        if ok and type(req) == 'table' then resp_body, extra = dispatch(req) end
+        local resp_body, extra, status
+        if ok and type(req) == 'table' then resp_body, extra, status = dispatch(req, session) end
 
         if resp_body then
-            conn:send_raw('HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n' ..
+            local line = status == 404 and 'HTTP/1.1 404 Not Found'
+                or status == 503 and 'HTTP/1.1 503 Service Unavailable'
+                or 'HTTP/1.1 200 OK'
+            conn:send_raw(line .. '\r\nContent-Type: application/json\r\n' ..
                 (extra or '') .. 'Content-Length: ' .. #resp_body ..
                 '\r\nConnection: close\r\n\r\n' .. resp_body)
         else
@@ -139,7 +156,42 @@ local function run_client()
         local first = rr.contents and rr.contents[1]
         if not (first and first.text == 'hello from resource') then return finish(false, 'resource read bad') end
 
-        finish(true, 'handshake + tools/list + tools/call + resources over real sockets')
+        -- Session expiry: the server "restarts" and rejects the old session
+        -- with 404. The client must re-initialize and retry transparently.
+        current_session = 'sess-def'
+        local r2 = tools[1].call({ msg = 'again' })
+        if r2.is_error then return finish(false, 'expired-session retry: ' .. tostring(r2.content)) end
+        if r2.content ~= 'echo: again' then return finish(false, 'retry content=' .. tostring(r2.content)) end
+        if c.transport.session_id ~= 'sess-def' then
+            return finish(false, 'renewed session_id=' .. tostring(c.transport.session_id))
+        end
+
+        -- Reconnect cooldown: the server "restarts" again but is still down,
+        -- so the 404-triggered re-initialize fails (503). Further calls must
+        -- fail fast with no network attempt until the cooldown elapses.
+        current_session = 'sess-ghi'
+        server_down = true
+        local r3 = tools[1].call({ msg = 'down' })
+        if not r3.is_error then return finish(false, 'server-down call should fail') end
+        if c.status ~= 'failed' then return finish(false, 'down status=' .. tostring(c.status)) end
+        local inits = init_count
+        local r4 = tools[1].call({ msg = 'cd' })
+        if not r4.is_error then return finish(false, 'cooldown call should fail') end
+        if init_count ~= inits then return finish(false, 'cooldown made a network attempt') end
+
+        -- Cooldown elapsed (shrink the window instead of sleeping 10s): the
+        -- next call must lazily reconnect and succeed without a manual reload.
+        server_down = false
+        mcp_client.RECONNECT_COOLDOWN_S = 0
+        local r5 = tools[1].call({ msg = 'back' })
+        if r5.is_error then return finish(false, 'lazy reconnect: ' .. tostring(r5.content)) end
+        if r5.content ~= 'echo: back' then return finish(false, 'lazy content=' .. tostring(r5.content)) end
+        if c.transport.session_id ~= 'sess-ghi' then
+            return finish(false, 'lazy session_id=' .. tostring(c.transport.session_id))
+        end
+        mcp_client.RECONNECT_COOLDOWN_S = 10
+
+        finish(true, 'handshake + tools + resources + 404 renewal + reconnect cooldown over real sockets')
     end)
     local ok, err = coroutine.resume(co)
     if not ok then finish(false, 'coroutine: ' .. tostring(err)) end

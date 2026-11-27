@@ -23,6 +23,10 @@ Client.__index = Client
 M.Client = Client
 
 local CLIENT_INFO = { name = 'xagent', version = '0.1.0' }
+-- After a failed reconnect, wait this long before the next lazy reconnect
+-- attempt, so a recovered server is picked up automatically without hammering
+-- one that is still down. Tests may shrink it.
+M.RECONNECT_COOLDOWN_S = 10
 -- Advertise the latest spec we target; we then adopt whatever version the server
 -- echoes back for the MCP-Protocol-Version header on subsequent requests.
 local CLIENT_PROTOCOL_VERSION = '2025-06-18'
@@ -107,8 +111,31 @@ end
 
 -- Raw request passthrough (used by the resource tools). Returns (result, err).
 function Client:request(method, params)
+    -- Lazy reconnect: a failed HTTP connection retries the handshake on the
+    -- next request, at most once per cooldown window (stdio stays manual —
+    -- respawning a child process is bootstrap's job).
+    if self.status == 'failed' and self.config.type ~= 'stdio' then
+        local now = os.time()
+        local wait = M.RECONNECT_COOLDOWN_S - (now - (self.last_reconnect_at or -math.huge))
+        if wait > 0 then
+            return nil, string.format('MCP server "%s" not connected (reconnect in %ds)', self.name, wait)
+        end
+        self.last_reconnect_at = now
+        local ok, cerr = self:connect()
+        if not ok then return nil, cerr end
+    end
     if self.status ~= 'connected' then return nil, 'MCP server "' .. self.name .. '" not connected' end
-    return self.io.rpc(self.transport, method, params)
+    local result, err, status = self.io.rpc(self.transport, method, params)
+    -- Streamable HTTP spec: a 404 means our session is gone (the server
+    -- restarted, e.g. a daemon auto-update). The client MUST re-initialize;
+    -- do that transparently and retry the request once.
+    if status == 404 and self.config.type ~= 'stdio' then
+        self.last_reconnect_at = os.time()   -- a failure here starts the cooldown
+        local ok, cerr = self:connect()
+        if not ok then return nil, cerr end
+        result, err = self.io.rpc(self.transport, method, params)
+    end
+    return result, err
 end
 
 -- Release the connection. A stdio server is asked to exit (stdin EOF) and is

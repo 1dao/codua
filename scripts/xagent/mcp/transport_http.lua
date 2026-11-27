@@ -110,7 +110,9 @@ function M.rpc(conn, method, params)
         if sid and sid ~= '' then conn.session_id = sid end
     end
     if resp.status and resp.status >= 400 then
-        return nil, format_http_error(resp)
+        -- Third return carries the HTTP status so callers can react to 404
+        -- (expired session → re-initialize, per the Streamable HTTP spec).
+        return nil, format_http_error(resp), resp.status
     end
 
     local objs, berr = M.parse_body(resp.headers and resp.headers['content-type'], resp.body)
